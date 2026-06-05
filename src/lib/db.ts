@@ -1,5 +1,5 @@
 import type { AgentConversation, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
-import { isSaasMode, uploadDataUrlToSaas, type SaasImagePurpose } from './saasApi'
+import { isSaasMode, uploadDataUrlToSaas, type SaasImagePurpose, type UploadProgressOptions } from './saasApi'
 
 const DB_NAME = 'gpt-image-playground'
 const DB_VERSION = 3
@@ -240,10 +240,10 @@ function hashDataUrlFallback(dataUrl: string): string {
  * 存储图片，若已存在（按 hash 去重）则跳过。
  * 返回 image id。
  */
-export async function storeImage(dataUrl: string, source: NonNullable<StoredImage['source']> = 'upload'): Promise<string> {
+export async function storeImage(dataUrl: string, source: NonNullable<StoredImage['source']> = 'upload', uploadOptions: UploadProgressOptions = {}): Promise<string> {
   if (isSaasMode()) {
     const purpose: SaasImagePurpose = source === 'mask' ? 'mask' : source === 'generated' ? 'generated' : 'input'
-    const id = await uploadDataUrlToSaas(dataUrl, purpose)
+    const id = await uploadDataUrlToSaas(dataUrl, purpose, uploadOptions)
     const thumbnail = await safeCreateImageThumbnail(dataUrl)
     await putImage({
       id,

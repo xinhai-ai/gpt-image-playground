@@ -279,6 +279,95 @@ describe('mask draft lifecycle in store actions', () => {
   })
 })
 
+describe('input image upload reconciliation', () => {
+  beforeEach(() => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key' },
+      prompt: '',
+      inputImages: [],
+      maskDraft: null,
+      maskEditorImageId: null,
+      appMode: 'gallery',
+      galleryInputDraft: null,
+      showToast: vi.fn(),
+    })
+  })
+
+  it('updates upload progress on the matching placeholder', () => {
+    useStore.setState({ inputImages: [{ id: 'upload-temp', dataUrl: imageA.dataUrl, uploading: true }] })
+
+    useStore.getState().setInputImageUploadProgress('upload-temp', 0.42)
+
+    const img = useStore.getState().inputImages[0]
+    expect(img.uploadProgress).toBeCloseTo(0.42)
+    expect(img.uploading).toBe(true)
+  })
+
+  it('clamps progress into the 0-1 range', () => {
+    useStore.setState({ inputImages: [{ id: 'upload-temp', dataUrl: imageA.dataUrl, uploading: true }] })
+
+    useStore.getState().setInputImageUploadProgress('upload-temp', 1.8)
+    expect(useStore.getState().inputImages[0].uploadProgress).toBe(1)
+
+    useStore.getState().setInputImageUploadProgress('upload-temp', -0.5)
+    expect(useStore.getState().inputImages[0].uploadProgress).toBe(0)
+  })
+
+  it('swaps the temp id for the real id, clears upload flags, and preserves mentions', () => {
+    const prompt = `参考 ${getSelectedImageMentionLabel(0)} 生成`
+    useStore.setState({
+      prompt,
+      inputImages: [{ id: 'upload-temp', dataUrl: imageA.dataUrl, uploading: true, uploadProgress: 1 }],
+    })
+
+    useStore.getState().resolveInputImageUpload('upload-temp', 'real-id')
+
+    const state = useStore.getState()
+    expect(state.inputImages).toEqual([{ id: 'real-id', dataUrl: imageA.dataUrl }])
+    expect(state.prompt).toBe(prompt)
+  })
+
+  it('drops the placeholder when the resolved id duplicates an existing image', () => {
+    useStore.setState({
+      inputImages: [
+        { id: 'real-id', dataUrl: imageA.dataUrl },
+        { id: 'upload-temp', dataUrl: imageA.dataUrl, uploading: true },
+      ],
+    })
+
+    useStore.getState().resolveInputImageUpload('upload-temp', 'real-id')
+
+    expect(useStore.getState().inputImages.map((img) => img.id)).toEqual(['real-id'])
+  })
+
+  it('removes an uploading placeholder on cancel/failure', () => {
+    useStore.setState({
+      inputImages: [
+        { id: 'keep', dataUrl: imageB.dataUrl },
+        { id: 'upload-temp', dataUrl: imageA.dataUrl, uploading: true },
+      ],
+    })
+
+    useStore.getState().removeUploadingInputImage('upload-temp')
+
+    expect(useStore.getState().inputImages.map((img) => img.id)).toEqual(['keep'])
+  })
+
+  it('excludes uploading placeholders from persisted gallery draft', () => {
+    useStore.setState({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key', persistInputOnRestart: true },
+      prompt: 'draft',
+      inputImages: [
+        { id: 'real-id', dataUrl: imageA.dataUrl },
+        { id: 'upload-temp', dataUrl: imageB.dataUrl, uploading: true },
+      ],
+    })
+
+    const persisted = getPersistedState(useStore.getState())
+    expect(persisted.inputImages).toEqual([{ id: 'real-id', dataUrl: '' }])
+  })
+})
+
 describe('interrupted OpenAI running tasks', () => {
   it('marks legacy and OpenAI running tasks as interrupted', () => {
     const now = 10_000

@@ -846,6 +846,12 @@ interface AppState {
   clearInputImages: () => void
   setInputImages: (imgs: InputImage[], options?: { equivalentImageIds?: Record<string, string> }) => void
   moveInputImage: (fromIdx: number, toIdx: number) => void
+  /** 上传进行中：更新某张占位图的进度（0-1） */
+  setInputImageUploadProgress: (id: string, progress: number) => void
+  /** 上传完成：将临时 id 替换为服务端真实 id 并清除上传态 */
+  resolveInputImageUpload: (tempId: string, realId: string) => void
+  /** 上传失败或取消：移除占位图 */
+  removeUploadingInputImage: (tempId: string) => void
   maskDraft: MaskDraft | null
   setMaskDraft: (draft: MaskDraft | null) => void
   clearMaskDraft: () => void
@@ -1132,7 +1138,10 @@ function saveGalleryInputDraft(state: Pick<AppState, 'appMode' | 'galleryInputDr
 }
 
 function getPersistableGalleryInputDraft(state: AppState) {
-  return saveGalleryInputDraft(state)
+  const draft = saveGalleryInputDraft(state)
+  if (!draft) return draft
+  const inputImages = draft.inputImages.filter((img) => !img.uploading)
+  return { ...draft, inputImages }
 }
 
 function restoreGalleryInputDraftState(draft: AgentInputDraft | null): Pick<AgentInputDraft, 'prompt' | 'inputImages' | 'maskDraft' | 'maskEditorImageId'> {
@@ -1181,7 +1190,7 @@ function getPersistableAgentInputDrafts(state: AppState) {
     if (!conversationIds.has(conversationId) || isEmptyAgentInputDraft(draft)) continue
     persistable[conversationId] = {
       ...copyAgentInputDraft(draft),
-      inputImages: draft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })),
+      inputImages: draft.inputImages.filter((img) => !img.uploading).map((img) => ({ id: img.id, dataUrl: '' })),
     }
   }
   return persistable
@@ -1377,6 +1386,49 @@ export const useStore = create<AppState>()(
           return syncActiveInputDraft(s, {
             inputImages: images,
             prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, images),
+          })
+        }),
+      setInputImageUploadProgress: (id, progress) =>
+        set((s) => {
+          const idx = s.inputImages.findIndex((img) => img.id === id)
+          if (idx < 0) return s
+          const inputImages = s.inputImages.map((img, i) =>
+            i === idx ? { ...img, uploadProgress: Math.min(1, Math.max(0, progress)) } : img,
+          )
+          return syncActiveInputDraft(s, { inputImages })
+        }),
+      resolveInputImageUpload: (tempId, realId) =>
+        set((s) => {
+          const idx = s.inputImages.findIndex((img) => img.id === tempId)
+          if (idx < 0) return s
+          // 服务端返回的真实 id 可能与已有图片重复（同一文件），此时移除占位图避免重复
+          const duplicateExists = s.inputImages.some((img, i) => i !== idx && img.id === realId)
+          if (duplicateExists) {
+            const inputImages = s.inputImages.filter((_, i) => i !== idx)
+            return syncActiveInputDraft(s, {
+              inputImages,
+              prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages),
+            })
+          }
+          const inputImages = s.inputImages.map((img, i) =>
+            i === idx ? { id: realId, dataUrl: img.dataUrl } : img,
+          )
+          return syncActiveInputDraft(s, {
+            inputImages,
+            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages, { [tempId]: realId }),
+          })
+        }),
+      removeUploadingInputImage: (tempId) =>
+        set((s) => {
+          const idx = s.inputImages.findIndex((img) => img.id === tempId)
+          if (idx < 0) return s
+          imageCache.delete(tempId)
+          const inputImages = s.inputImages.filter((_, i) => i !== idx)
+          const shouldClearMask = tempId === s.maskDraft?.targetImageId
+          return syncActiveInputDraft(s, {
+            inputImages,
+            prompt: remapImageMentionsForOrder(s.prompt, s.inputImages, inputImages),
+            ...(shouldClearMask ? { maskDraft: null, maskEditorImageId: null } : {}),
           })
         }),
       maskDraft: null,
@@ -5113,11 +5165,51 @@ export async function importData(file: File, options: ImportOptions = { importCo
   }
 }
 
-/** 添加图片到输入（文件上传） */
+/** 上传中占位图的 AbortController，按临时 id 索引，供取消上传使用 */
+const inputUploadAbortControllers = new Map<string, AbortController>()
+
+/** 取消上传中占位图：中止请求并移除占位图 */
+export function cancelInputImageUpload(tempId: string): void {
+  const controller = inputUploadAbortControllers.get(tempId)
+  if (controller) controller.abort()
+  inputUploadAbortControllers.delete(tempId)
+  useStore.getState().removeUploadingInputImage(tempId)
+}
+
+/**
+ * 添加图片到输入（文件上传）。
+ * 先立即插入占位缩略图，再在后台上传，上传进度通过 store 反映到 UI。
+ * Promise 在占位图插入后即 resolve，不等待上传完成（非阻塞）。
+ */
 export async function addImageFromFile(file: File): Promise<void> {
-  const image = await createInputImageFromFile(file)
-  if (!image) return
-  useStore.getState().addInputImage(image)
+  if (!file.type.startsWith('image/')) return
+  const dataUrl = await fileToDataUrl(file)
+  const tempId = `upload-${genId()}`
+  cacheImage(tempId, dataUrl)
+  useStore.getState().addInputImage({ id: tempId, dataUrl, uploading: true })
+
+  const controller = new AbortController()
+  inputUploadAbortControllers.set(tempId, controller)
+
+  void (async () => {
+    try {
+      const realId = await storeImage(dataUrl, 'upload', {
+        signal: controller.signal,
+        onProgress: (progress) => useStore.getState().setInputImageUploadProgress(tempId, progress),
+      })
+      cacheImage(realId, dataUrl)
+      useStore.getState().resolveInputImageUpload(tempId, realId)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      useStore.getState().removeUploadingInputImage(tempId)
+      useStore.getState().showToast(
+        `图片上传失败：${err instanceof Error ? err.message : String(err)}`,
+        'error',
+      )
+    } finally {
+      inputUploadAbortControllers.delete(tempId)
+    }
+  })()
 }
 
 export async function createInputImageFromFile(file: File): Promise<InputImage | null> {

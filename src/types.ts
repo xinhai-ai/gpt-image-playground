@@ -134,10 +134,16 @@ export const DEFAULT_PARAMS: TaskParams = {
 // ===== 输入图片（UI 层面） =====
 
 export interface InputImage {
-  /** IndexedDB image store 的 id（SHA-256 hash） */
+  /** IndexedDB image store 的 id（SHA-256 hash），上传中时为临时 id */
   id: string
   /** data URL，用于预览 */
   dataUrl: string
+  /** 上传进行中（仅内存态，不持久化） */
+  uploading?: boolean
+  /** 上传进度 0-1，未知时为 undefined（不确定态） */
+  uploadProgress?: number
+  /** 上传失败标记 */
+  uploadError?: boolean
 }
 
 export interface MaskDraft {

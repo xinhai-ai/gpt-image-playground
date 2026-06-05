@@ -8,17 +8,18 @@ import { installMobileViewportGuards } from './lib/viewport'
 
 installMobileViewportGuards()
 
+// Service worker 已移除。注销此前部署版本注册的 SW 并清理其缓存，
+// 否则老客户端会继续用缓存的旧应用壳，无法获取更新。
 if ('serviceWorker' in navigator) {
-  if (import.meta.env.PROD) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).catch((error) => {
-        console.error('Service worker registration failed:', error)
-      })
-    })
-  } else {
-    navigator.serviceWorker.getRegistrations().then((registrations) => {
-      registrations.forEach((registration) => registration.unregister())
-    })
+  void navigator.serviceWorker.getRegistrations().then((registrations) => {
+    registrations.forEach((registration) => void registration.unregister())
+  }).catch(() => {})
+  if (typeof caches !== 'undefined') {
+    void caches.keys().then((keys) => {
+      keys
+        .filter((key) => key.startsWith('gpt-image-playground'))
+        .forEach((key) => void caches.delete(key))
+    }).catch(() => {})
   }
 }
 

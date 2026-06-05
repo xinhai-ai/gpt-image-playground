@@ -10,6 +10,7 @@ export interface SaasSession {
   user: {
     id: string
     email: string
+    name?: string
     isPlatformAdmin?: boolean
     disabledAt?: string | null
     createdAt: string
@@ -139,6 +140,71 @@ export function login(email: string, password: string): Promise<SaasSession> {
 
 export function logout(): Promise<{ ok: true }> {
   return saasRequest<{ ok: true }>('/auth/logout', { method: 'POST' })
+}
+
+export interface AccountSession {
+  id: string
+  current: boolean
+  ip: string | null
+  userAgent: string | null
+  lastSeenAt: string
+  createdAt: string
+  expiresAt: string
+}
+
+export interface AccountDetail {
+  user: {
+    id: string
+    email: string
+    name: string
+    isPlatformAdmin: boolean
+    createdAt: string
+  }
+  tenant: {
+    id: string
+    name: string
+    slug: string
+    role: string
+    createdAt: string
+  }
+  security: {
+    hasPassword: boolean
+    oauthProviders: string[]
+  }
+  usage: {
+    tasks: number
+    images: number
+    storageBytes: number
+  }
+  sessions: AccountSession[]
+}
+
+export function getAccountDetail(): Promise<AccountDetail> {
+  return saasRequest<AccountDetail>('/account')
+}
+
+export function updateAccountName(name: string): Promise<{ user: { id: string; name: string } }> {
+  return saasRequest('/account', {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function changeAccountPassword(input: {
+  currentPassword?: string
+  newPassword: string
+  logoutOtherSessions?: boolean
+}): Promise<{ ok: true; hasPassword: true; revokedSessions: number }> {
+  return saasRequest('/account/password', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function revokeOtherSessions(): Promise<{ ok: true; revokedSessions: number }> {
+  return saasRequest('/account/sessions/revoke-others', {
+    method: 'POST',
+  })
 }
 
 export interface OAuthOptions {
@@ -277,6 +343,81 @@ export async function uploadImageBlobToSaas(blob: Blob, purpose: SaasImagePurpos
   return uploaded.imageId
 }
 
+export interface UploadProgressOptions {
+  /** 上传进度回调，progress 为 0-1；total 未知时不会触发 */
+  onProgress?: (progress: number) => void
+  signal?: AbortSignal
+}
+
+/**
+ * 带上传进度的图片上传。fetch 无法上报上传进度，故使用 XMLHttpRequest。
+ */
+export function uploadImageBlobToSaasWithProgress(
+  blob: Blob,
+  purpose: SaasImagePurpose,
+  options: UploadProgressOptions = {},
+): Promise<string> {
+  const { onProgress, signal } = options
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
+
+  return new Promise<string>((resolve, reject) => {
+    const formData = new FormData()
+    formData.append('purpose', purpose)
+    formData.append('file', blob, imageFileName(blob))
+
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', buildUrl('/storage/images'))
+    xhr.withCredentials = true
+    xhr.responseType = 'text'
+
+    const onAbort = () => xhr.abort()
+    signal?.addEventListener('abort', onAbort)
+    const cleanup = () => signal?.removeEventListener('abort', onAbort)
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress?.(Math.min(1, event.loaded / event.total))
+      }
+    }
+
+    xhr.onload = () => {
+      cleanup()
+      const parsePayload = (): unknown => {
+        try {
+          return JSON.parse(xhr.responseText)
+        } catch {
+          return { error: xhr.responseText || `HTTP ${xhr.status}` }
+        }
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const payload = parsePayload() as { imageId?: string }
+        if (payload && typeof payload.imageId === 'string') {
+          resolve(payload.imageId)
+        } else {
+          reject(makeSaasError(xhr.status, parsePayload()))
+        }
+        return
+      }
+      reject(makeSaasError(xhr.status, parsePayload()))
+    }
+
+    xhr.onerror = () => {
+      cleanup()
+      reject(new SaasApiError(xhr.status || 0, '网络错误，上传失败', null))
+    }
+    xhr.onabort = () => {
+      cleanup()
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+
+    xhr.send(formData)
+  })
+}
+
+function makeSaasError(status: number, payload: unknown): SaasApiError {
+  return new SaasApiError(status, getPayloadErrorMessage(payload, `HTTP ${status}`), payload)
+}
+
 async function uploadExistingImageBlobToSaas(imageId: string, blob: Blob): Promise<void> {
   const formData = new FormData()
   formData.append('file', blob, imageFileName(blob))
@@ -286,9 +427,9 @@ async function uploadExistingImageBlobToSaas(imageId: string, blob: Blob): Promi
   })
 }
 
-export async function uploadDataUrlToSaas(dataUrl: string, purpose: SaasImagePurpose): Promise<string> {
+export async function uploadDataUrlToSaas(dataUrl: string, purpose: SaasImagePurpose, options: UploadProgressOptions = {}): Promise<string> {
   const blob = await dataUrlToBlob(dataUrl)
-  return uploadImageBlobToSaas(blob, purpose)
+  return uploadImageBlobToSaasWithProgress(blob, purpose, options)
 }
 
 export function listSaasTasks(): Promise<{ tasks: TaskRecord[] }> {

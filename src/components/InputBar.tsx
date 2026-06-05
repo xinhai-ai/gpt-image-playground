@@ -1,6 +1,6 @@
 import { useRef, useEffect, useCallback, useState, useMemo, useLayoutEffect, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { ALL_FAVORITES_COLLECTION_ID, deleteFavoriteCollection, getTaskFavoriteCollectionIds, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, getCachedImage, ensureImageCached, getActiveAgentRounds } from '../store'
+import { ALL_FAVORITES_COLLECTION_ID, deleteFavoriteCollection, getTaskFavoriteCollectionIds, useStore, submitTask, submitAgentMessage, stopAgentResponse, addImageFromFile, createInputImageFromFile, deleteImageIfUnreferenced, removeMultipleTasks, getCachedImage, ensureImageCached, getActiveAgentRounds, cancelInputImageUpload } from '../store'
 import { DEFAULT_PARAMS, type TaskRecord } from '../types'
 import { getActiveApiProfile, normalizeSettings } from '../lib/apiProfiles'
 import { DEFAULT_FAL_IMAGE_SIZE, getChangedParams, getOutputImageLimitForSettings, normalizeParamsForSettings } from '../lib/paramCompatibility'
@@ -325,6 +325,47 @@ function setContentEditableSelection(el: HTMLElement, start: number, end: number
 }
 
 /** 通用悬浮气泡提示 */
+function UploadProgressRing({ progress }: { progress?: number }) {
+  // progress 为 undefined 时显示不确定态（旋转）；有值时显示确定弧度
+  const size = 26
+  const stroke = 3
+  const radius = (size - stroke) / 2
+  const circumference = 2 * Math.PI * radius
+  const indeterminate = progress == null
+  const clamped = Math.min(1, Math.max(0, progress ?? 0))
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      className={indeterminate ? 'animate-spin' : ''}
+      style={{ transform: indeterminate ? undefined : 'rotate(-90deg)' }}
+    >
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={radius}
+        fill="none"
+        stroke="rgba(255,255,255,0.35)"
+        strokeWidth={stroke}
+      />
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={radius}
+        fill="none"
+        stroke="#ffffff"
+        strokeWidth={stroke}
+        strokeLinecap="round"
+        strokeDasharray={circumference}
+        strokeDashoffset={indeterminate ? circumference * 0.75 : circumference * (1 - clamped)}
+        style={{ transition: indeterminate ? undefined : 'stroke-dashoffset 0.2s ease' }}
+      />
+    </svg>
+  )
+}
+
 function ButtonTooltip({ visible, text }: { visible: boolean; text: ReactNode }) {
   if (!visible) return null
 
@@ -756,13 +797,18 @@ export default function InputBar() {
       : normalizeSettings({ ...settings, activeProfileId: activeProfile.id })
   ), [activeProfile.id, currentActiveProfile.id, settings])
   const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
-  const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning)
+  const hasUploadingImage = inputImages.some((img) => img.uploading)
+  const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning && !hasUploadingImage)
   const submitButtonAriaLabel = activeAgentIsRunning
     ? '停止生成'
     : hasSubmitApiConfig
     ? maskDraft ? '遮罩编辑' : '生成图像'
     : '请先配置 API'
-  const submitTooltipText = activeAgentIsRunning ? '停止生成' : '尚未完成 API 配置，请在右上角设置中进行'
+  const submitTooltipText = activeAgentIsRunning
+    ? '停止生成'
+    : hasUploadingImage
+    ? '图片上传中，请稍候…'
+    : '尚未完成 API 配置，请在右上角设置中进行'
   const promptPlaceholder = '描述你想生成的图片，可输入 @ 来指定参考图...'
   const submitCurrentMode = useCallback(() => {
     if (appMode === 'agent') {
@@ -1655,8 +1701,9 @@ export default function InputBar() {
   }
 
   const renderImageThumb = (img: (typeof inputImages)[number], idx: number) => {
+    const isUploading = Boolean(img.uploading)
     const isMaskTarget = maskDraft?.targetImageId === img.id
-    const canEdit = !maskTargetImage || isMaskTarget
+    const canEdit = !isUploading && (!maskTargetImage || isMaskTarget)
     const imageHintText = isMaskTarget ? '遮罩图必须为第一张图' : ''
     const displaySrc = isMaskTarget && maskPreviewUrl ? maskPreviewUrl : img.dataUrl
     const isImageDragging = imageDragIndex === idx
@@ -1665,6 +1712,10 @@ export default function InputBar() {
     const showDropAfter = imageDragOverIndex === inputImages.length && isLast && imageDragIndex !== idx
 
     const handleDragStart = (e: React.DragEvent) => {
+      if (isUploading) {
+        e.preventDefault()
+        return
+      }
       if (isMaskTarget) {
         showImageHintUntilRelease(img.id)
         e.preventDefault()
@@ -1767,8 +1818,8 @@ export default function InputBar() {
         key={img.id}
         data-input-image-index={idx}
         className={`relative group inline-block h-[52px] w-[52px] shrink-0 self-start transition-opacity ${isImageDragging ? 'opacity-40' : ''}`}
-        style={{ touchAction: isMaskTarget ? 'auto' : 'none' }}
-        draggable={!isMobile}
+        style={{ touchAction: isMaskTarget || isUploading ? 'auto' : 'none' }}
+        draggable={!isMobile && !isUploading}
         onMouseLeave={hideImageHint}
         onDragStart={handleDragStart}
         onDragOver={handleDragOver}
@@ -1780,6 +1831,7 @@ export default function InputBar() {
         onTouchCancel={handleTouchCancel}
         onContextMenu={(e) => {
           e.preventDefault()
+          if (isUploading) return
           const el = textareaRef.current
           const cursor = el ? getContentEditableCursor(el) : prompt.length
           if (el) {
@@ -1812,12 +1864,15 @@ export default function InputBar() {
           <div className="absolute -right-[5px] top-0 bottom-0 w-[2px] bg-blue-500 rounded-full z-40 shadow-sm pointer-events-none" />
         )}
         <div
-          className={`relative w-[52px] h-[52px] rounded-xl overflow-hidden shadow-sm cursor-grab active:cursor-grabbing select-none ${
+          className={`relative w-[52px] h-[52px] rounded-xl overflow-hidden shadow-sm select-none ${
+            isUploading ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'
+          } ${
             isMaskTarget
               ? 'border-2 border-blue-500'
               : 'border border-gray-200 dark:border-white/[0.08]'
           }`}
           onClick={() => {
+            if (isUploading) return
             if (suppressImageClickRef.current) return
             if (isMaskTarget) {
               setMaskEditorImageId(img.id)
@@ -1834,9 +1889,16 @@ export default function InputBar() {
             <div className="h-full w-full overflow-hidden rounded-xl">
               <img
                 src={displaySrc}
-                className="w-full h-full object-cover hover:opacity-90 transition-opacity pointer-events-none"
+                className={`w-full h-full object-cover transition-opacity pointer-events-none ${
+                  isUploading ? 'opacity-40' : 'hover:opacity-90'
+                }`}
                 alt=""
               />
+            </div>
+          )}
+          {isUploading && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/25 backdrop-blur-[1px] pointer-events-none">
+              <UploadProgressRing progress={img.uploadProgress} />
             </div>
           )}
           {isMaskTarget && (
@@ -1862,12 +1924,19 @@ export default function InputBar() {
             </button>
           )}
         </div>
-        {!isMaskTarget && (
+        {(!isMaskTarget || isUploading) && (
           <span
-            className="absolute right-0 top-0 flex h-5 w-5 translate-x-1/2 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-red-500 text-white opacity-0 shadow-md transition-opacity hover:bg-red-600 group-hover:opacity-100 z-30"
+            className={`absolute right-0 top-0 flex h-5 w-5 translate-x-1/2 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-red-500 text-white shadow-md transition-opacity hover:bg-red-600 z-30 ${
+              isUploading ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+            }`}
+            title={isUploading ? '取消上传' : undefined}
             onClick={(e) => {
               e.stopPropagation()
-              removeInputImage(idx)
+              if (isUploading) {
+                cancelInputImageUpload(img.id)
+              } else {
+                removeInputImage(idx)
+              }
             }}
           >
             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2432,7 +2501,7 @@ export default function InputBar() {
                   onMouseEnter={() => setSubmitHover(true)}
                   onMouseLeave={() => setSubmitHover(false)}
                 >
-                  <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig) && submitHover} text={submitTooltipText} />
+                  <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig || hasUploadingImage) && submitHover} text={submitTooltipText} />
                   <button
                     onClick={() => activeAgentIsRunning ? stopActiveAgentResponse() : hasSubmitApiConfig ? submitCurrentMode() : setShowSettings(true)}
                     disabled={activeAgentIsRunning ? false : hasSubmitApiConfig ? !canSubmit : false}
@@ -2539,7 +2608,7 @@ export default function InputBar() {
                   onMouseEnter={() => setSubmitHover(true)}
                   onMouseLeave={() => setSubmitHover(false)}
                 >
-                  <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig) && submitHover} text={submitTooltipText} />
+                  <ButtonTooltip visible={(activeAgentIsRunning || !hasSubmitApiConfig || hasUploadingImage) && submitHover} text={submitTooltipText} />
                   <button
                     onClick={() => activeAgentIsRunning ? stopActiveAgentResponse() : hasSubmitApiConfig ? submitCurrentMode() : setShowSettings(true)}
                     disabled={activeAgentIsRunning ? false : hasSubmitApiConfig ? !canSubmit : false}

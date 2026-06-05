@@ -7,24 +7,14 @@ import ViewportTooltip from './ViewportTooltip'
 import HelpModal from './HelpModal'
 import HistoryModal from './HistoryModal'
 import { useFavoriteCollectionTitle } from './FavoriteCollections'
-import { EditIcon, HelpCircleIcon, HistoryIcon, InstallIcon, SettingsIcon } from './icons'
+import { EditIcon, HelpCircleIcon, HistoryIcon, SettingsIcon } from './icons'
 import { useSaasAuth } from './AuthGate'
-
-type BeforeInstallPromptEvent = Event & {
-  prompt: () => Promise<void>
-  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>
-}
-
-function isInstalledPwa() {
-  const nav = window.navigator as Navigator & { standalone?: boolean }
-  return window.matchMedia('(display-mode: standalone)').matches || nav.standalone === true
-}
+import AccountModal from './AccountModal'
 
 export default function Header() {
   const appMode = useStore((s) => s.appMode)
   const setAppMode = useStore((s) => s.setAppMode)
   const setShowSettings = useStore((s) => s.setShowSettings)
-  const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const agentMobileHeaderVisible = useStore((s) => s.agentMobileHeaderVisible)
   const setAgentMobileHeaderVisible = useStore((s) => s.setAgentMobileHeaderVisible)
   const agentConversations = useStore((s) => s.agentConversations)
@@ -38,11 +28,12 @@ export default function Header() {
   const showFavoriteCollectionTitle = appMode === 'gallery' && Boolean(activeFavoriteCollectionId)
   const { hasUpdate, latestRelease, dismiss } = useVersionCheck()
   const [showHelp, setShowHelp] = useState(false)
-  const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null)
-  const [isPwaInstalled, setIsPwaInstalled] = useState(isInstalledPwa)
   const [hintVisible, setHintVisible] = useState(false)
   const [scrollDirection, setScrollDirection] = useState<'up' | 'down'>('up')
   const [showHistoryModal, setShowHistoryModal] = useState(false)
+  const [showAccountMenu, setShowAccountMenu] = useState(false)
+  const [showAccountModal, setShowAccountModal] = useState(false)
+  const accountMenuRef = useRef<HTMLDivElement>(null)
   const historyButtonRef = useRef<HTMLButtonElement>(null)
   const createConversation = useStore((s) => s.createAgentConversation)
   const saasAuth = useSaasAuth()
@@ -89,71 +80,27 @@ export default function Header() {
     }
   }, [appMode, agentMobileHeaderVisible])
 
-  const installTooltip = useTooltip()
   const helpTooltip = useTooltip()
   const settingsTooltip = useTooltip()
 
   useEffect(() => {
-    const handleBeforeInstallPrompt = (event: Event) => {
-      event.preventDefault()
-      setInstallPrompt(event as BeforeInstallPromptEvent)
-      setIsPwaInstalled(false)
-    }
-
-    const handleAppInstalled = () => {
-      setInstallPrompt(null)
-      setIsPwaInstalled(true)
-    }
-
-    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
-    window.addEventListener('appinstalled', handleAppInstalled)
-
-    return () => {
-      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
-      window.removeEventListener('appinstalled', handleAppInstalled)
-    }
-  }, [])
-
-  const handleInstallClick = async () => {
-    if (installPrompt) {
-      const promptEvent = installPrompt
-      setInstallPrompt(null)
-
-      try {
-        await promptEvent.prompt()
-        const choice = await promptEvent.userChoice
-        setIsPwaInstalled(choice.outcome === 'accepted')
-      } catch {
-        setIsPwaInstalled(isInstalledPwa())
-      }
-    } else {
-      const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-      if (isIos) {
-        setConfirmDialog({
-          title: '安装为应用',
-          message: '在 Safari 浏览器中，点击底部「分享」按钮，选择「添加到主屏幕」即可安装此应用。',
-          showCancel: false,
-          confirmText: '我知道了',
-          icon: 'info',
-          action: () => {},
-        })
-      } else {
-        setConfirmDialog({
-          title: '安装为应用',
-          message: '请在浏览器的菜单中选择「添加到主屏幕」或「安装应用」。\n\n（如果在微信等内置浏览器中，请先在外部浏览器打开）',
-          showCancel: false,
-          confirmText: '我知道了',
-          icon: 'info',
-          action: () => {},
-        })
+    if (!showAccountMenu) return
+    const handleClickOutside = (event: MouseEvent) => {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target as Node)) {
+        setShowAccountMenu(false)
       }
     }
-  }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [showAccountMenu])
 
   const openAdmin = () => {
     dismissAllTooltips()
+    setShowAccountMenu(false)
     window.location.hash = 'admin'
   }
+
+  const accountInitial = (saasAuth?.session.user.name?.trim() || saasAuth?.session.user.email || '?').charAt(0).toUpperCase()
 
   return (
     <>
@@ -264,62 +211,55 @@ export default function Header() {
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {saasAuth && (
-              <>
-                <div className="hidden md:flex items-center gap-2 mr-1 rounded-lg border border-gray-200 dark:border-white/[0.08] px-2 py-1 text-xs text-gray-600 dark:text-gray-300">
-                  <span className="max-w-36 truncate" title={saasAuth.session.user.email}>{saasAuth.session.user.email}</span>
-                  {canOpenAdmin && (
-                    <button
-                      type="button"
-                      onClick={openAdmin}
-                      className="font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-300"
-                    >
-                      后台
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => void saasAuth.logout()}
-                    className="font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-300"
-                  >
-                    退出
-                  </button>
-                </div>
-                {canOpenAdmin && (
-                  <button
-                    type="button"
-                    onClick={openAdmin}
-                    className="md:hidden px-2 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
-                  >
-                    后台
-                  </button>
-                )}
+              <div className="relative mr-0.5" ref={accountMenuRef}>
                 <button
                   type="button"
-                  onClick={() => void saasAuth.logout()}
-                  className="md:hidden px-2 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
+                  onClick={() => setShowAccountMenu((visible) => !visible)}
+                  className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-500 text-sm font-semibold text-white transition-colors hover:bg-blue-600 dark:bg-blue-600 dark:hover:bg-blue-500"
+                  aria-label="账户菜单"
+                  title={saasAuth.session.user.email}
                 >
-                  退出
+                  {accountInitial}
                 </button>
-              </>
-            )}
-            {!isPwaInstalled && (
-              <div
-                className="relative"
-                {...installTooltip.handlers}
-              >
-                <button
-                  onClick={() => {
-                    dismissAllTooltips()
-                    handleInstallClick()
-                  }}
-                  className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-900 transition-colors"
-                  aria-label="安装为应用"
-                >
-                  <InstallIcon className="w-5 h-5 text-gray-600 dark:text-gray-400" />
-                </button>
-                <ViewportTooltip visible={installTooltip.visible} className="whitespace-nowrap">
-                  安装为应用
-                </ViewportTooltip>
+                {showAccountMenu && (
+                  <div className="absolute right-0 top-full z-50 mt-1.5 w-56 overflow-hidden rounded-xl border border-gray-200/60 bg-white/95 py-1 shadow-[0_8px_30px_rgb(0,0,0,0.12)] ring-1 ring-black/5 backdrop-blur-xl animate-dropdown-down dark:border-white/[0.08] dark:bg-gray-900/95 dark:shadow-[0_8px_30px_rgb(0,0,0,0.3)] dark:ring-white/10">
+                    <div className="border-b border-gray-100 px-3 py-2 dark:border-white/[0.08]">
+                      {saasAuth.session.user.name?.trim() && (
+                        <div className="truncate text-sm font-medium text-gray-800 dark:text-gray-100">{saasAuth.session.user.name}</div>
+                      )}
+                      <div className="truncate text-xs text-gray-500 dark:text-gray-400" title={saasAuth.session.user.email}>{saasAuth.session.user.email}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAccountMenu(false)
+                        setShowAccountModal(true)
+                      }}
+                      className="flex w-full items-center px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-100/80 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                    >
+                      个人中心
+                    </button>
+                    {canOpenAdmin && (
+                      <button
+                        type="button"
+                        onClick={openAdmin}
+                        className="flex w-full items-center px-3 py-2 text-sm text-gray-700 transition-colors hover:bg-gray-100/80 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                      >
+                        后台管理
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAccountMenu(false)
+                        void saasAuth.logout()
+                      }}
+                      className="flex w-full items-center px-3 py-2 text-sm text-red-500 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-500/10"
+                    >
+                      退出登录
+                    </button>
+                  </div>
+                )}
               </div>
             )}
             <div
@@ -393,6 +333,7 @@ export default function Header() {
         </div>
       </div>
       {showHelp && <HelpModal appMode={appMode} isFavoriteCollectionOverview={appMode === 'gallery' && filterFavorite && !activeFavoriteCollectionId} onClose={() => setShowHelp(false)} />}
+      {saasAuth && <AccountModal open={showAccountModal} onClose={() => setShowAccountModal(false)} />}
     </>
   )
 }

@@ -35,7 +35,7 @@ import {
   type AppAuth,
 } from './auth.js'
 import { config } from './config.js'
-import { decryptSecret, encryptSecret, normalizeEmail } from './crypto.js'
+import { decryptSecret, encryptSecret, hashPassword, normalizeEmail, verifyPassword } from './crypto.js'
 import { prisma } from './prisma.js'
 import { callProvider, type ProviderImageResult, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
@@ -122,6 +122,12 @@ const registerSchema = z.object({
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1).max(200),
+})
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1).max(200).optional(),
+  newPassword: z.string().min(8).max(200),
+  logoutOtherSessions: z.boolean().optional(),
 })
 
 const uploadUrlSchema = z.object({
@@ -417,6 +423,7 @@ function publicSession(auth: AuthContext, providerProfiles: ProviderProfile[] = 
     user: {
       id: auth.user.id,
       email: auth.user.email,
+      name: auth.user.name || '',
       isPlatformAdmin: isPlatformAdminUser(auth.user),
       disabledAt: auth.user.disabledAt?.toISOString() ?? null,
       createdAt: auth.user.createdAt.toISOString(),
@@ -590,6 +597,25 @@ async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promis
     return null
   }
   return auth
+}
+
+async function getCurrentSessionToken(request: FastifyRequest): Promise<string | null> {
+  try {
+    const session = await betterAuthInstance().api.getSession({
+      headers: betterAuthHeaders(request),
+    }) as BetterAuthSessionPayload | null
+    return session?.session?.token ?? null
+  } catch {
+    return null
+  }
+}
+
+async function userHasPassword(userId: string): Promise<boolean> {
+  const account = await prisma.account.findFirst({
+    where: { userId, providerId: 'credential', password: { not: null } },
+    select: { id: true },
+  })
+  return Boolean(account)
 }
 
 async function requirePlatformAdmin(request: FastifyRequest, reply: FastifyReply): Promise<AuthContext | null> {
@@ -1397,6 +1423,33 @@ export async function buildApp() {
     stopTaskWorker()
   })
 
+  // 全局错误处理：统一为 { error, detail? } 结构，避免泄漏 Fastify 默认的
+  // { statusCode, error, message } 结构或未捕获异常的堆栈。
+  app.setErrorHandler((error, request, reply) => {
+    if (error instanceof z.ZodError) {
+      sendZodError(reply, error)
+      return
+    }
+    // Fastify schema 校验错误
+    if ((error as { validation?: unknown }).validation) {
+      reply.status(400).send({ error: '请求参数无效', detail: [errorMessage(error)] })
+      return
+    }
+    const status = apiErrorStatus(error)
+    if (status && status >= 400 && status < 500) {
+      reply.status(status).send({ error: apiErrorMessage(error) })
+      return
+    }
+    // 请求体过大等由 Fastify 抛出且带有 statusCode 的错误
+    const fastifyStatus = (error as { statusCode?: number }).statusCode
+    if (typeof fastifyStatus === 'number' && fastifyStatus >= 400 && fastifyStatus < 500) {
+      reply.status(fastifyStatus).send({ error: errorMessage(error) })
+      return
+    }
+    request.log.error(error)
+    reply.status(500).send({ error: '服务器内部错误' })
+  })
+
   app.get('/api/health', async () => ({ ok: true }))
 
   app.route({
@@ -1518,6 +1571,156 @@ export async function buildApp() {
     if (!auth) return
     const providerProfiles = await listProviderProfiles(auth.tenant.id)
     return publicSession(auth, providerProfiles)
+  })
+
+  app.get('/api/account', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    const currentToken = await getCurrentSessionToken(request)
+    const [accounts, sessions, taskCount, imageAggregate] = await prisma.$transaction([
+      prisma.account.findMany({
+        where: { userId: auth.user.id },
+        select: { providerId: true, createdAt: true },
+      }),
+      prisma.session.findMany({
+        where: { userId: auth.user.id },
+        orderBy: { lastSeenAt: 'desc' },
+        select: { id: true, token: true, ip: true, ipAddress: true, userAgent: true, lastSeenAt: true, createdAt: true, expiresAt: true },
+      }),
+      prisma.task.count({ where: { createdByUserId: auth.user.id } }),
+      prisma.imageAsset.aggregate({ where: { createdByUserId: auth.user.id }, _count: { _all: true }, _sum: { byteSize: true } }),
+    ])
+    const oauthProviders = [...new Set(accounts.filter((account) => account.providerId !== 'credential').map((account) => account.providerId))]
+    return {
+      user: {
+        id: auth.user.id,
+        email: auth.user.email,
+        name: auth.user.name || '',
+        isPlatformAdmin: isPlatformAdminUser(auth.user),
+        createdAt: auth.user.createdAt.toISOString(),
+      },
+      tenant: {
+        id: auth.tenant.id,
+        name: auth.tenant.name,
+        slug: auth.tenant.slug,
+        role: auth.membership.role,
+        createdAt: auth.tenant.createdAt.toISOString(),
+      },
+      security: {
+        hasPassword: await userHasPassword(auth.user.id),
+        oauthProviders,
+      },
+      usage: {
+        tasks: taskCount,
+        images: imageAggregate._count._all,
+        storageBytes: imageAggregate._sum.byteSize ?? 0,
+      },
+      sessions: sessions.map((session) => ({
+        id: session.id,
+        current: Boolean(currentToken && session.token === currentToken),
+        ip: session.ip ?? session.ipAddress ?? null,
+        userAgent: session.userAgent ?? null,
+        lastSeenAt: session.lastSeenAt.toISOString(),
+        createdAt: session.createdAt.toISOString(),
+        expiresAt: session.expiresAt.toISOString(),
+      })),
+    }
+  })
+
+  app.patch('/api/account', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    const body = parseBody(z.object({ name: z.string().trim().min(1).max(80) }), request.body)
+    const user = await prisma.user.update({
+      where: { id: auth.user.id },
+      data: { name: body.name },
+      select: { id: true, name: true },
+    })
+    await writeUsageLog({ request, auth, action: 'account.update', targetType: 'user', targetId: user.id })
+    return { user: { id: user.id, name: user.name } }
+  })
+
+  app.post('/api/account/password', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    if (!await enforceRateLimit(request, reply, {
+      bucket: 'account.password',
+      keyParts: [auth.user.id],
+      max: 10,
+      windowMs: 10 * 60_000,
+    })) return
+    const body = parseBody(changePasswordSchema, request.body)
+    const existing = await prisma.account.findFirst({
+      where: { userId: auth.user.id, providerId: 'credential' },
+    })
+
+    if (existing?.password) {
+      // 已有密码：必须校验当前密码
+      if (!body.currentPassword) {
+        return reply.status(400).send({ error: '请输入当前密码' })
+      }
+      const valid = await verifyPassword(body.currentPassword, existing.password)
+      if (!valid) {
+        return reply.status(400).send({ error: '当前密码不正确' })
+      }
+    }
+
+    const passwordHash = await hashPassword(body.newPassword)
+    if (existing) {
+      await prisma.account.update({ where: { id: existing.id }, data: { password: passwordHash } })
+    } else {
+      await prisma.account.create({
+        data: {
+          accountId: auth.user.id,
+          providerId: 'credential',
+          userId: auth.user.id,
+          password: passwordHash,
+        },
+      })
+    }
+
+    let revokedSessions = 0
+    if (body.logoutOtherSessions) {
+      const currentToken = await getCurrentSessionToken(request)
+      const result = await prisma.session.deleteMany({
+        where: {
+          userId: auth.user.id,
+          ...(currentToken ? { token: { not: currentToken } } : {}),
+        },
+      })
+      revokedSessions = result.count
+    }
+
+    await writeUsageLog({
+      request,
+      auth,
+      action: existing?.password ? 'account.password.change' : 'account.password.set',
+      targetType: 'user',
+      targetId: auth.user.id,
+      detail: { revokedSessions },
+    })
+    return { ok: true, hasPassword: true, revokedSessions }
+  })
+
+  app.post('/api/account/sessions/revoke-others', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    const currentToken = await getCurrentSessionToken(request)
+    const result = await prisma.session.deleteMany({
+      where: {
+        userId: auth.user.id,
+        ...(currentToken ? { token: { not: currentToken } } : {}),
+      },
+    })
+    await writeUsageLog({
+      request,
+      auth,
+      action: 'account.sessions.revoke_others',
+      targetType: 'user',
+      targetId: auth.user.id,
+      detail: { revokedSessions: result.count },
+    })
+    return { ok: true, revokedSessions: result.count }
   })
 
   app.get('/api/auth/oauth-options', async () => ({
