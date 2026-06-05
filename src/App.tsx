@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { initStore } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
@@ -20,6 +20,9 @@ import ImageContextMenu from './components/ImageContextMenu'
 import SupportPromptModal from './components/SupportPromptModal'
 import { FavoriteCollectionPickerModal, FavoriteCollectionsView, ManageCollectionsModal } from './components/FavoriteCollections'
 import { useGlobalClickSuppression } from './lib/clickSuppression'
+import AuthGate from './components/AuthGate'
+import { isSaasMode } from './lib/saasApi'
+import AdminDashboard from './components/AdminDashboard'
 
 let customProviderConfigUrlImportStarted = false
 
@@ -28,8 +31,13 @@ export default function App() {
   const appMode = useStore((s) => s.appMode)
   const filterFavorite = useStore((s) => s.filterFavorite)
   const activeFavoriteCollectionId = useStore((s) => s.activeFavoriteCollectionId)
+  const saasMode = isSaasMode()
+  const [showAdmin, setShowAdmin] = useState(() => saasMode && window.location.hash === '#admin')
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
+  const handleSaasReady = useCallback(() => {
+    initStore()
+  }, [])
 
   useEffect(() => {
     const searchParams = new URLSearchParams(window.location.search)
@@ -59,8 +67,8 @@ export default function App() {
         })
     }
 
-    initStore()
-  }, [setSettings])
+    if (!saasMode) initStore()
+  }, [saasMode, setSettings])
 
   useEffect(() => {
     const preventPageImageDrag = (e: DragEvent) => {
@@ -73,30 +81,55 @@ export default function App() {
     return () => document.removeEventListener('dragstart', preventPageImageDrag)
   }, [])
 
-  return (
+  useEffect(() => {
+    if (!saasMode) return
+    const handleHashChange = () => setShowAdmin(window.location.hash === '#admin')
+    window.addEventListener('hashchange', handleHashChange)
+    handleHashChange()
+    return () => window.removeEventListener('hashchange', handleHashChange)
+  }, [saasMode])
+
+  const closeAdmin = useCallback(() => {
+    if (window.location.hash === '#admin') {
+      window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`)
+      setShowAdmin(false)
+      return
+    }
+    setShowAdmin(false)
+  }, [])
+
+  const app = (
     <>
-      <Header />
-      {appMode === 'agent' ? (
-        <AgentWorkspace />
+      {showAdmin ? (
+        <AdminDashboard onClose={closeAdmin} />
       ) : (
-        <main data-home-main data-drag-select-surface className="pb-48">
-          <div className="safe-area-x max-w-7xl mx-auto">
-            <SearchBar />
-            {filterFavorite && !activeFavoriteCollectionId ? <FavoriteCollectionsView /> : <TaskGrid />}
-          </div>
-        </main>
+        <>
+          <Header />
+          {appMode === 'agent' ? (
+            <AgentWorkspace />
+          ) : (
+            <main data-home-main data-drag-select-surface className="pb-48">
+              <div className="safe-area-x max-w-7xl mx-auto">
+                <SearchBar />
+                {filterFavorite && !activeFavoriteCollectionId ? <FavoriteCollectionsView /> : <TaskGrid />}
+              </div>
+            </main>
+          )}
+          <InputBar />
+          <DetailModal />
+          <Lightbox />
+          <SettingsModal />
+          <SupportPromptModal />
+          <FavoriteCollectionPickerModal />
+          <ManageCollectionsModal />
+          <MaskEditorModal />
+          <ImageContextMenu />
+        </>
       )}
-      <InputBar />
-      <DetailModal />
-      <Lightbox />
-      <SettingsModal />
       <ConfirmDialog />
-      <SupportPromptModal />
-      <FavoriteCollectionPickerModal />
-      <ManageCollectionsModal />
       <Toast />
-      <MaskEditorModal />
-      <ImageContextMenu />
     </>
   )
+
+  return saasMode ? <AuthGate onReady={handleSaasReady}>{app}</AuthGate> : app
 }

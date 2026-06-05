@@ -1,0 +1,79 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "${WEB_PORT:-8080}:3001"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3001
+      STATIC_DIR: /app/public
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-${WEB_ORIGIN:-http://localhost:8080}}
+      DATABASE_URL: postgresql://gpt_image:gpt_image@postgres:5432/gpt_image
+      SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-change-me}
+      PROVIDER_KEY_ENCRYPTION_SECRET: ${PROVIDER_KEY_ENCRYPTION_SECRET:-dev-provider-secret-change-me}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_CALLBACK_URL: ${GITHUB_CALLBACK_URL:-}
+      ALLOW_PRIVATE_PROVIDER_URLS: ${ALLOW_PRIVATE_PROVIDER_URLS:-false}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      IMAGE_MAX_UPLOAD_BYTES: ${IMAGE_MAX_UPLOAD_BYTES:-67108864}
+      IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-67108864}
+      TASK_WORKER_CONCURRENCY: ${TASK_WORKER_CONCURRENCY:-2}
+      TASK_WORKER_LEASE_SECONDS: ${TASK_WORKER_LEASE_SECONDS:-1800}
+      TASK_WORKER_RECOVER_INTERVAL_SECONDS: ${TASK_WORKER_RECOVER_INTERVAL_SECONDS:-60}
+      COOKIE_SECURE: "false"
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: gpt-image-assets
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_FORCE_PATH_STYLE: "true"
+      DEFAULT_PROVIDER_NAME: OpenAI
+      DEFAULT_PROVIDER: openai
+      DEFAULT_PROVIDER_BASE_URL: https://api.openai.com/v1
+      DEFAULT_PROVIDER_MODEL: gpt-image-2
+      DEFAULT_PROVIDER_API_MODE: images
+      DEFAULT_PROVIDER_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gpt_image
+      POSTGRES_USER: gpt_image
+      POSTGRES_PASSWORD: gpt_image
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gpt_image -d gpt_image"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  minio-data:

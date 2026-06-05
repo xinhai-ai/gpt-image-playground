@@ -1,6 +1,7 @@
 import { ensureImageCached } from '../store'
 import { zipSync } from 'fflate'
 import type { TaskRecord } from '../types'
+import { getSaasImageReadUrl, isSaasMode } from './saasApi'
 
 const MIME_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
@@ -108,6 +109,13 @@ export function getImageZipEntries(imageIds: string[], fileNameBase = 'image'): 
 async function getImageBlob(imageIdOrUrl: string): Promise<Blob> {
   let src = imageIdOrUrl
   if (!imageIdOrUrl.startsWith('data:') && !imageIdOrUrl.startsWith('http://') && !imageIdOrUrl.startsWith('https://')) {
+    if (isSaasMode()) {
+      const signed = await getSaasImageReadUrl(imageIdOrUrl, 'original')
+      const response = await fetch(signed.readUrl, { cache: 'no-store' })
+      if (!response.ok) throw new Error(`读取图片失败：${imageIdOrUrl}`)
+      const blob = await response.blob()
+      return blob.type ? blob : new Blob([await blob.arrayBuffer()], { type: signed.contentType || 'image/png' })
+    }
     src = await ensureImageCached(imageIdOrUrl) ?? imageIdOrUrl
   }
 
@@ -138,4 +146,3 @@ function sanitizeFileNamePart(value: string): string {
 function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
-

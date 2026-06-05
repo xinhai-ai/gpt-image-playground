@@ -8,6 +8,7 @@ import HelpModal from './HelpModal'
 import HistoryModal from './HistoryModal'
 import { useFavoriteCollectionTitle } from './FavoriteCollections'
 import { EditIcon, HelpCircleIcon, HistoryIcon, InstallIcon, SettingsIcon } from './icons'
+import { useSaasAuth } from './AuthGate'
 
 type BeforeInstallPromptEvent = Event & {
   prompt: () => Promise<void>
@@ -44,6 +45,8 @@ export default function Header() {
   const [showHistoryModal, setShowHistoryModal] = useState(false)
   const historyButtonRef = useRef<HTMLButtonElement>(null)
   const createConversation = useStore((s) => s.createAgentConversation)
+  const saasAuth = useSaasAuth()
+  const canOpenAdmin = Boolean(saasAuth?.session.user.isPlatformAdmin)
 
   useEffect(() => {
     if (appMode === 'agent') {
@@ -145,6 +148,11 @@ export default function Header() {
         })
       }
     }
+  }
+
+  const openAdmin = () => {
+    dismissAllTooltips()
+    window.location.hash = 'admin'
   }
 
   return (
@@ -255,6 +263,45 @@ export default function Header() {
             </button>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {saasAuth && (
+              <>
+                <div className="hidden md:flex items-center gap-2 mr-1 rounded-lg border border-gray-200 dark:border-white/[0.08] px-2 py-1 text-xs text-gray-600 dark:text-gray-300">
+                  <span className="max-w-36 truncate" title={saasAuth.session.user.email}>{saasAuth.session.user.email}</span>
+                  {canOpenAdmin && (
+                    <button
+                      type="button"
+                      onClick={openAdmin}
+                      className="font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-300"
+                    >
+                      后台
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void saasAuth.logout()}
+                    className="font-medium text-gray-800 hover:text-blue-600 dark:text-gray-100 dark:hover:text-blue-300"
+                  >
+                    退出
+                  </button>
+                </div>
+                {canOpenAdmin && (
+                  <button
+                    type="button"
+                    onClick={openAdmin}
+                    className="md:hidden px-2 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
+                  >
+                    后台
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void saasAuth.logout()}
+                  className="md:hidden px-2 py-1.5 rounded-lg text-xs font-medium text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-900"
+                >
+                  退出
+                </button>
+              </>
+            )}
             {!isPwaInstalled && (
               <div
                 className="relative"

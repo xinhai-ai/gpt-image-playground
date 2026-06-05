@@ -157,7 +157,7 @@ npx wrangler login
 npm run deploy:cf
 ```
 
-部署脚本会先执行 `npm run build`，再通过 `wrangler deploy` 上传 `dist/` 目录。
+部署脚本会先执行 `pnpm build`，再通过 `wrangler deploy` 上传 `dist/` 目录。
 
 **配置默认 API URL**：Cloudflare Workers 的环境变量不会自动改写已经构建好的静态文件。若需预设默认 API 地址，请在构建前设置 `VITE_DEFAULT_API_URL` 后再部署。
 
@@ -242,18 +242,23 @@ docker run -d -p 8080:80 \
 
 *(注：使用 host 网络时加 `--network host`，修改容器监听端口使用 `-e PORT=28080`)*
 
-**2. Docker Compose 示例**
+**2. Docker Compose 示例（SaaS 后端 + 静态前端 + PostgreSQL + MinIO）**
 
-```yaml
-services:
-  gpt-image-playground:
-    image: ghcr.io/cooksleep/gpt_image_playground:latest
-    environment:
-      - DEFAULT_API_URL=https://api.openai.com/v1
-    ports:
-      - "8080:80"
-    restart: unless-stopped
+仓库已内置 `docker-compose.yml`，会启动 `api`、`postgres`、`minio` 三个服务。`api` 镜像会同时构建 Vite 前端并由 Fastify 提供静态网页，浏览器同源访问 `/api`：
+
+```bash
+OPENAI_API_KEY=sk-xxxx docker compose up -d
 ```
+
+访问 `http://localhost:8080` 后注册账号即可进入画廊。MinIO 控制台位于 `http://localhost:9001`，默认账号密码为 `minioadmin` / `minioadmin`。
+
+如果本机 `8080` 已被占用，可改用：
+
+```bash
+WEB_PORT=28080 WEB_ORIGIN=http://localhost:28080 OPENAI_API_KEY=sk-xxxx docker compose up -d
+```
+
+> 生产部署时建议替换 `SESSION_SECRET`、`PROVIDER_KEY_ENCRYPTION_SECRET`，并将 `S3_PUBLIC_ENDPOINT` 配置为浏览器和模型服务商均可访问的 S3/R2 地址。
 
 **更新说明：**
 
@@ -271,8 +276,8 @@ services:
 **导入自定义服务商配置**：`VITE_DEFAULT_API_URL` 除了填写普通 API 地址外，也支持直接填写 `.json` 配置 URL 或带 `settings` 参数的分享 URL。设为配置 URL 时，页面启动后会自动导入其中的自定义服务商和 API 配置，设置页显示的是配置 JSON 中 profile 定义的 `baseUrl`（而非配置 URL 本身）。
 
 ```bash
-npm install
-npm run dev
+pnpm install
+pnpm dev
 ```
 
 **2. 本地开发跨域代理 (可选)**
@@ -283,14 +288,14 @@ npm run dev
 cp dev-proxy.config.example.json dev-proxy.config.json
 ```
 
-修改 `dev-proxy.config.json`，将 `target` 设置为真实的完整 API 基础地址。代理不会自动补 `/v1`，OpenAI 兼容接口通常必须填写到版本前缀，如 `https://api.example.com/v1`。重启开发服务器后，在页面设置中开启 **API 代理** 即可（请求将被转发如 `http://localhost:5173/api-proxy/... -> target/...`）。此功能仅在 `npm run dev` 阶段生效，不会影响打包产物。
+修改 `dev-proxy.config.json`，将 `target` 设置为真实的完整 API 基础地址。代理不会自动补 `/v1`，OpenAI 兼容接口通常必须填写到版本前缀，如 `https://api.example.com/v1`。重启开发服务器后，在页面设置中开启 **API 代理** 即可（请求将被转发如 `http://localhost:5173/api-proxy/... -> target/...`）。此功能仅在 `pnpm dev` 阶段生效，不会影响打包产物。
 
 **3. 本地故障模拟 API (可选)**
 
 如果需要复现图片 URL 跨域、接口返回结构异常、原始响应查看等问题，可启动内置模拟服务：
 
 ```powershell
-npm run mock:api
+pnpm mock:api
 ```
 
 使用方式见 [本地故障模拟 API](docs/mock-image-api.md)。
@@ -298,7 +303,7 @@ npm run mock:api
 **4. 构建静态产物**
 
 ```bash
-npm run build
+pnpm build
 ```
 
 构建输出的文件位于 `dist/` 目录下，可将其部署至任何静态文件服务器（如普通 Nginx、GitHub Pages、Netlify 等）。

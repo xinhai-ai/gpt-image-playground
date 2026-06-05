@@ -1,0 +1,264 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TenantRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum ImagePurpose {
+  INPUT
+  MASK
+  GENERATED
+  THUMBNAIL
+}
+
+enum ImageStatus {
+  PENDING
+  READY
+  ERROR
+}
+
+enum TaskStatus {
+  RUNNING
+  DONE
+  ERROR
+}
+
+enum TaskImageRole {
+  INPUT
+  MASK
+  OUTPUT
+  THUMBNAIL
+}
+
+model User {
+  id              String         @id @default(cuid())
+  name            String         @default("")
+  email           String         @unique
+  emailVerified   Boolean        @default(true)
+  image           String?
+  passwordHash    String         @default("")
+  isPlatformAdmin Boolean        @default(false)
+  disabledAt      DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  sessions        Session[]
+  accounts        Account[]
+  memberships     TenantMember[]
+  images          ImageAsset[]   @relation("ImageCreatedBy")
+  tasks           Task[]         @relation("TaskCreatedBy")
+  usageLogs       UsageLog[]
+  oauthAccounts   OAuthAccount[]
+}
+
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  provider          String
+  providerAccountId String
+  userId            String
+  profile           Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  lastSeenAt DateTime @default(now())
+  userAgent String?
+  ipAddress String?
+  ip        String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  accountId             String
+  providerId            String
+  userId                String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@unique([providerId, accountId])
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+model Tenant {
+  id              String            @id @default(cuid())
+  name            String
+  slug            String            @unique
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  members         TenantMember[]
+  providerProfiles ProviderProfile[]
+  images          ImageAsset[]
+  tasks           Task[]
+  taskImages      TaskImage[]
+  usageLogs       UsageLog[]
+}
+
+model TenantMember {
+  id        String     @id @default(cuid())
+  tenantId  String
+  userId    String
+  role      TenantRole @default(MEMBER)
+  createdAt DateTime   @default(now())
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+}
+
+model ProviderProfile {
+  id              String   @id @default(cuid())
+  tenantId        String
+  name            String
+  provider        String
+  baseUrl         String
+  model           String
+  apiMode         String   @default("images")
+  apiKeyEncrypted String?
+  config          Json?
+  disabledAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tasks           Task[]
+
+  @@index([tenantId])
+}
+
+model ImageAsset {
+  id              String       @id @default(cuid())
+  tenantId        String
+  bucket          String
+  objectKey       String
+  contentType     String
+  byteSize        Int
+  sha256          String?
+  width           Int?
+  height          Int?
+  purpose         ImagePurpose
+  status          ImageStatus  @default(PENDING)
+  createdByUserId String
+  error           String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  tenant          Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy       User         @relation("ImageCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  taskImages      TaskImage[]
+
+  @@unique([bucket, objectKey])
+  @@index([tenantId])
+  @@index([tenantId, status])
+}
+
+model Task {
+  id                String          @id @default(cuid())
+  tenantId          String
+  prompt            String
+  params            Json
+  provider          String
+  status            TaskStatus      @default(RUNNING)
+  error             String?
+  rawResponsePayload String?
+  rawImageUrls      Json?
+  actualParams      Json?
+  providerProfileId String?
+  createdByUserId   String
+  attemptCount      Int             @default(0)
+  workerId          String?
+  workerStartedAt   DateTime?
+  workerLeaseExpiresAt DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  finishedAt        DateTime?
+  tenant            Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  providerProfile   ProviderProfile? @relation(fields: [providerProfileId], references: [id], onDelete: SetNull)
+  createdBy         User            @relation("TaskCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  images            TaskImage[]
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, status])
+  @@index([createdByUserId])
+  @@index([status, workerLeaseExpiresAt])
+}
+
+model TaskImage {
+  id                String        @id @default(cuid())
+  tenantId          String
+  taskId            String
+  imageAssetId      String
+  role              TaskImageRole
+  sortIndex         Int           @default(0)
+  providerImageUrl  String?
+  actualParams      Json?
+  revisedPrompt     String?
+  createdAt         DateTime      @default(now())
+  tenant            Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  task              Task          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  imageAsset        ImageAsset    @relation(fields: [imageAssetId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, imageAssetId, role])
+  @@index([tenantId])
+  @@index([imageAssetId])
+}
+
+model UsageLog {
+  id         String   @id @default(cuid())
+  tenantId   String?
+  userId     String?
+  action     String
+  targetType String?
+  targetId   String?
+  detail     Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+  tenant     Tenant?  @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([tenantId, createdAt])
+  @@index([action, createdAt])
+}

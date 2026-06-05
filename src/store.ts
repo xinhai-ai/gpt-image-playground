@@ -42,6 +42,16 @@ import {
   storeImage,
 } from './lib/db'
 import { callImageApi } from './lib/api'
+import {
+  createSaasTaskEventSource,
+  createSaasTask,
+  fetchSaasImageDataUrl,
+  fetchSaasImageThumbnailDataUrl,
+  isSaasMode,
+  listSaasTasks,
+  SaasApiError,
+  type SaasTaskEvent,
+} from './lib/saasApi'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
 import { showBrowserNotification } from './lib/browserNotification'
@@ -77,6 +87,9 @@ const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let saasTaskEventSource: EventSource | null = null
+let saasTaskReconcileTimer: ReturnType<typeof setInterval> | null = null
+let saasTaskReconcileRunning = false
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -187,6 +200,22 @@ export async function ensureImageCached(id: string): Promise<string | undefined>
     cacheImage(id, rec.dataUrl)
     return rec.dataUrl
   }
+  if (isSaasMode()) {
+    try {
+      const dataUrl = await fetchSaasImageDataUrl(id)
+      if (dataUrl) {
+        cacheImage(id, dataUrl)
+        await putImage({
+          id,
+          dataUrl,
+          createdAt: Date.now(),
+        })
+        return dataUrl
+      }
+    } catch {
+      return undefined
+    }
+  }
   return undefined
 }
 
@@ -196,6 +225,25 @@ export async function ensureImageThumbnailCached(id: string): Promise<{ dataUrl:
 
   const rec = await getStoredFreshImageThumbnail(id)
   if (!rec?.thumbnailDataUrl) {
+    if (isSaasMode()) {
+      try {
+        const thumbnailDataUrl = await fetchSaasImageThumbnailDataUrl(id)
+        if (!thumbnailDataUrl) return undefined
+        const thumbnail = {
+          dataUrl: thumbnailDataUrl,
+          thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+        }
+        cacheThumbnail(id, thumbnail)
+        await putImageThumbnail({
+          id,
+          thumbnailDataUrl,
+          thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+        })
+        return thumbnail
+      } catch {
+        return undefined
+      }
+    }
     scheduleThumbnailBackfill([id], 'visible')
     return undefined
   }
@@ -1717,6 +1765,108 @@ function clearOpenAIWatchdogTimer(taskId: string) {
   openAIWatchdogTimers.delete(taskId)
 }
 
+function mergeSaasTaskLocalState(remoteTask: TaskRecord, localTask?: TaskRecord): TaskRecord {
+  return localTask
+    ? {
+        ...remoteTask,
+        isFavorite: localTask.isFavorite,
+        favoriteCollectionIds: localTask.favoriteCollectionIds,
+      }
+    : remoteTask
+}
+
+async function cacheSaasTaskOutputThumbnails(task: TaskRecord): Promise<void> {
+  if (task.status !== 'done') return
+  await Promise.all(task.outputImages.map((imageId) => cacheGeneratedThumbnailFromSaas(imageId).catch(() => undefined)))
+}
+
+async function applySaasTaskList(remoteTasks: TaskRecord[], options: { preserveLocalRunning?: boolean } = { preserveLocalRunning: true }): Promise<TaskRecord[]> {
+  const currentTasks = useStore.getState().tasks
+  const localTasksById = new Map(currentTasks.map((task) => [task.id, task]))
+  const remoteTaskIds = new Set(remoteTasks.map((task) => task.id))
+  const mergedTasks = remoteTasks.map((task) => mergeSaasTaskLocalState(task, localTasksById.get(task.id)))
+  const localRunningTasks = options.preserveLocalRunning
+    ? currentTasks.filter((task) => task.status === 'running' && !remoteTaskIds.has(task.id))
+    : []
+  const tasks = [...mergedTasks, ...localRunningTasks]
+  await Promise.all(tasks.map((task) => putTask(task)))
+  await Promise.all(tasks.map(cacheSaasTaskOutputThumbnails))
+  useStore.getState().setTasks(tasks)
+  return tasks
+}
+
+async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
+  const currentTasks = useStore.getState().tasks
+  const existing = currentTasks.find((task) => task.id === event.task.id)
+  const task = mergeSaasTaskLocalState(event.task, existing)
+  if (existing) {
+    updateTaskInStore(task.id, task)
+  } else {
+    useStore.getState().setTasks([task, ...currentTasks])
+    await putTask(task)
+  }
+  await cacheSaasTaskOutputThumbnails(task)
+  if (event.phase === 'done') {
+    useStore.getState().showToast(`生成完成，共 ${task.outputImages.length} 张图片`, 'success')
+    if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${task.outputImages.length} 张图片。`)
+  }
+  if (event.phase === 'error') {
+    useStore.getState().setDetailTaskId(task.id)
+  }
+}
+
+async function reconcileSaasTasks(): Promise<void> {
+  if (!isSaasMode() || saasTaskReconcileRunning) return
+  saasTaskReconcileRunning = true
+  try {
+    await applySaasTaskList((await listSaasTasks()).tasks)
+  } catch (error) {
+    console.warn('Failed to reconcile SaaS tasks:', error)
+  } finally {
+    saasTaskReconcileRunning = false
+  }
+}
+
+function startSaasTaskReconcileLoop(): void {
+  if (!isSaasMode() || saasTaskReconcileTimer) return
+  saasTaskReconcileTimer = setInterval(() => {
+    void reconcileSaasTasks()
+  }, 30_000)
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', () => void reconcileSaasTasks())
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) void reconcileSaasTasks()
+    })
+  }
+}
+
+function startSaasTaskEvents(): void {
+  if (!isSaasMode() || saasTaskEventSource) return
+  try {
+    const source = createSaasTaskEventSource()
+    saasTaskEventSource = source
+    source.onopen = () => {
+      void reconcileSaasTasks()
+    }
+    source.onmessage = (message) => {
+      try {
+        const event = JSON.parse(message.data) as Partial<SaasTaskEvent>
+        if (event.type === 'task.updated' && event.task && event.phase) {
+          void applySaasTaskEvent(event as SaasTaskEvent)
+        }
+      } catch (error) {
+        console.warn('Failed to parse SaaS task event:', error)
+      }
+    }
+    source.onerror = () => {
+      void reconcileSaasTasks()
+    }
+  } catch (error) {
+    console.warn('Failed to start SaaS task events:', error)
+  }
+  startSaasTaskReconcileLoop()
+}
+
 function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.now()) {
   const task = useStore.getState().tasks.find((item) => item.id === taskId)
   if (!task || !isRunningOpenAITask(task)) return false
@@ -2027,7 +2177,18 @@ async function recoverFalTask(taskId: string) {
 /** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
-  const storedTasks = await getAllTasks()
+  let storedTasks = await getAllTasks()
+  if (isSaasMode()) {
+    try {
+      const localTasksById = new Map(storedTasks.map((task) => [task.id, task]))
+      const remoteTasks = (await listSaasTasks()).tasks.map((task) => mergeSaasTaskLocalState(task, localTasksById.get(task.id)))
+      await Promise.all(remoteTasks.map((task) => putTask(task)))
+      await Promise.all(remoteTasks.map(cacheSaasTaskOutputThumbnails))
+      storedTasks = remoteTasks
+    } catch (error) {
+      console.warn('Failed to load SaaS tasks:', error)
+    }
+  }
   const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
   let loadedAgentConversations = mergeAgentConversationsForStorage(storedAgentConversations, legacyAgentConversations)
   const currentAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
@@ -2062,7 +2223,9 @@ export async function initStore() {
   if (shouldRewritePersistedLocalState) {
     useStore.setState({})
   }
-  const { tasks: markedTasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
+  const { tasks: markedTasks, interruptedTasks } = isSaasMode()
+    ? { tasks: storedTasks, interruptedTasks: [] }
+    : markInterruptedOpenAIRunningTasks(storedTasks)
   const interruptedTaskIds = new Set(interruptedTasks.map((task) => task.id))
   const favoriteState = useStore.getState()
   const normalizedFavorites = normalizeLoadedFavoriteState(markedTasks.map(getPersistableTask), favoriteState.favoriteCollections, favoriteState.defaultFavoriteCollectionId)
@@ -2093,6 +2256,9 @@ export async function initStore() {
     ) {
       scheduleCustomRecovery(task.id, 0)
     }
+  }
+  if (isSaasMode()) {
+    startSaasTaskEvents()
   }
 
   // 收集所有任务引用的图片 id
@@ -2259,7 +2425,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     }
   }
 
-  if (validateApiProfile(activeProfile)) {
+  if (!isSaasMode() && validateApiProfile(activeProfile)) {
     showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
     useStore.getState().setShowSettings(true)
     return
@@ -2473,12 +2639,13 @@ async function generateAgentConversationTitle(
     return { agentGeneratingTitleIds: next }
   })
   try {
-    const imageDataUrls = await readAgentImageDataUrls(inputImageIds)
+    const imageDataUrls = isSaasMode() ? undefined : await readAgentImageDataUrls(inputImageIds)
     const title = await callAgentConversationTitleApi({
       settings: requestSettings,
       profile: activeProfile,
       prompt,
       imageDataUrls,
+      imageIds: isSaasMode() ? inputImageIds : undefined,
     })
     if (!title || title === fallbackTitle) return
 
@@ -2716,7 +2883,7 @@ async function readAgentImageDataUrls(ids: string[]) {
 }
 
 async function createAgentUserInputItem(conversation: AgentConversation, round: AgentRound, message: AgentMessage, tasks: TaskRecord[]) {
-  const imageDataUrls = await readAgentImageDataUrls(round.inputImageIds)
+  const imageDataUrls = isSaasMode() ? [] : await readAgentImageDataUrls(round.inputImageIds)
   const rounds = getAgentRoundPath(conversation, round.id)
   const text = replaceAgentPromptImageReferencesForApi(message.content, round, rounds, tasks)
   const referenceText = round.inputImageIds.length > 0
@@ -2726,13 +2893,15 @@ async function createAgentUserInputItem(conversation: AgentConversation, round: 
     role: 'user',
     content: [
       { type: 'input_text', text: `${text}${referenceText}` },
-      ...imageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl })),
+      ...(isSaasMode()
+        ? round.inputImageIds.map((imageId) => ({ type: 'input_image', image_id: imageId }))
+        : imageDataUrls.map((dataUrl) => ({ type: 'input_image', image_url: dataUrl }))),
     ],
   }
 }
 
 async function createAgentGeneratedImagesInputItem(round: AgentRound, tasks: TaskRecord[]) {
-  const contentParts: Array<{ type: string; text?: string; image_url?: string }> = []
+  const contentParts: Array<{ type: string; text?: string; image_url?: string; image_id?: string }> = []
   let imageIndex = 0
   for (const taskId of round.outputTaskIds) {
     const task = tasks.find((item) => item.id === taskId)
@@ -2742,9 +2911,13 @@ async function createAgentGeneratedImagesInputItem(round: AgentRound, tasks: Tas
       continue
     }
     for (const imageId of task.outputImages) {
-      const dataUrl = await ensureImageCached(imageId)
-      if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
+      if (isSaasMode()) {
+        contentParts.push({ type: 'input_image', image_id: imageId })
+      } else {
+        const dataUrl = await ensureImageCached(imageId)
+        if (dataUrl) {
+          contentParts.push({ type: 'input_image', image_url: dataUrl })
+        }
       }
       const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
       const prompt = truncateAgentReferencePrompt(task.prompt || '')
@@ -2758,7 +2931,7 @@ async function createAgentGeneratedImagesInputItem(round: AgentRound, tasks: Tas
 }
 
 async function createAgentBatchImagesInputItem(round: AgentRound, tasks: TaskRecord[], batchTaskIds: string[]) {
-  const contentParts: Array<{ type: string; text?: string; image_url?: string }> = []
+  const contentParts: Array<{ type: string; text?: string; image_url?: string; image_id?: string }> = []
   // Count existing images in the round to compute correct imageIndex offset
   let baseImageIndex = 0
   for (const taskId of round.outputTaskIds) {
@@ -2771,9 +2944,13 @@ async function createAgentBatchImagesInputItem(round: AgentRound, tasks: TaskRec
     const task = tasks.find((item) => item.id === taskId)
     if (!task || task.status !== 'done') continue
     for (const imgId of task.outputImages) {
-      const dataUrl = await ensureImageCached(imgId)
-      if (dataUrl) {
-        contentParts.push({ type: 'input_image', image_url: dataUrl })
+      if (isSaasMode()) {
+        contentParts.push({ type: 'input_image', image_id: imgId })
+      } else {
+        const dataUrl = await ensureImageCached(imgId)
+        if (dataUrl) {
+          contentParts.push({ type: 'input_image', image_url: dataUrl })
+        }
       }
       const refId = getAgentGeneratedImageReferenceId(round, imageIndex)
       const prompt = truncateAgentReferencePrompt(task.prompt || '')
@@ -3061,7 +3238,7 @@ export async function submitAgentMessage() {
     return
   }
 
-  if (validateApiProfile(activeProfile)) {
+  if (!isSaasMode() && validateApiProfile(activeProfile)) {
     showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
     state.setShowSettings(true)
     return
@@ -3211,7 +3388,7 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     return
   }
 
-  if (validateApiProfile(activeProfile)) {
+  if (!isSaasMode() && validateApiProfile(activeProfile)) {
     showToast(`请先完善请求 API 配置：${validateApiProfile(activeProfile)}`, 'error')
     state.setShowSettings(true)
     return
@@ -3327,8 +3504,8 @@ async function executeAgentRound(
     const round = conversation.rounds.find((item) => item.id === roundId)
     const userMessage = round ? conversation.messages.find((message) => message.id === round.userMessageId) : null
     if (!round || !userMessage) return
-    const maskDataUrl = round.maskImageId ? await ensureImageCached(round.maskImageId) : undefined
-    if (round.maskImageId && !maskDataUrl) throw new Error('遮罩图片已不存在')
+    const maskDataUrl = !isSaasMode() && round.maskImageId ? await ensureImageCached(round.maskImageId) : undefined
+    if (!isSaasMode() && round.maskImageId && !maskDataUrl) throw new Error('遮罩图片已不存在')
 
     const apiInput = await buildAgentApiInput(conversation, round, latestState.tasks)
     if (controller.signal.aborted) throw createAgentAbortError()
@@ -3474,6 +3651,13 @@ async function executeAgentRound(
     const resolveReferenceImages = async (referenceIds: string[]): Promise<{ dataUrls: string[]; imageIds: string[] }> => {
       const dataUrls: string[] = []
       const imageIds: string[] = []
+      const addReferenceImage = async (imageId: string | undefined) => {
+        if (!imageId) return
+        imageIds.push(imageId)
+        if (isSaasMode()) return
+        const dataUrl = await ensureImageCached(imageId)
+        if (dataUrl) dataUrls.push(dataUrl)
+      }
       for (const refId of referenceIds) {
         // Resolve both generated image refs and current/user input refs from XML tags.
         const latestConv = useStore.getState().agentConversations.find((item) => item.id === conversationId)
@@ -3482,21 +3666,14 @@ async function executeAgentRound(
           for (let imgIdx = 0; imgIdx < r.inputImageIds.length; imgIdx++) {
             const currentRefId = getAgentCurrentReferenceId(r, imgIdx)
             if (currentRefId === refId) {
-              const imageId = r.inputImageIds[imgIdx]
-              const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
-              imageIds.push(imageId)
+              await addReferenceImage(r.inputImageIds[imgIdx])
             }
           }
           const outputImages = collectAgentRoundOutputImageSlots(r, useStore.getState().tasks)
           for (let imgIdx = 0; imgIdx < outputImages.length; imgIdx++) {
             const generatedRefId = getAgentGeneratedImageReferenceId(r, imgIdx)
             if (generatedRefId === refId) {
-              const imageId = outputImages[imgIdx]
-              if (!imageId) continue
-              const dataUrl = await ensureImageCached(imageId)
-              if (dataUrl) dataUrls.push(dataUrl)
-              imageIds.push(imageId)
+              await addReferenceImage(outputImages[imgIdx] ?? undefined)
             }
           }
         }
@@ -3538,6 +3715,7 @@ async function executeAgentRound(
           batchItemId: item.id,
           prompt: item.prompt,
           referenceImageDataUrls: references.dataUrls,
+          referenceImageIds: references.imageIds,
           referenceIds,
           signal: controller.signal,
           onImageToolStarted: shouldStreamAssistantMessage
@@ -3612,6 +3790,7 @@ async function executeAgentRound(
         params,
         input: apiInputForTurn,
         maskDataUrl,
+        maskImageId: isSaasMode() ? round.maskImageId ?? undefined : undefined,
         signal: controller.signal,
         onTextDelta: shouldStreamAssistantMessage
           ? (delta) => {
@@ -3930,6 +4109,10 @@ async function executeTask(taskId: string) {
   const { settings } = useStore.getState()
   const task = useStore.getState().tasks.find((t) => t.id === taskId)
   if (!task) return
+  if (isSaasMode()) {
+    await executeSaasTask(taskId, task)
+    return
+  }
   const taskProfile = getTaskApiProfile(settings, task)
   if (!taskProfile && task.apiProfileId) {
     updateTaskInStore(taskId, {
@@ -4137,6 +4320,65 @@ async function executeTask(taskId: string) {
     for (const imgId of task.inputImageIds) {
       imageCache.delete(imgId)
     }
+  }
+}
+
+async function cacheGeneratedThumbnailFromSaas(imageId: string) {
+  const thumbnailDataUrl = await fetchSaasImageThumbnailDataUrl(imageId).catch(() => undefined)
+  if (!thumbnailDataUrl) return
+  const thumbnail = {
+    dataUrl: thumbnailDataUrl,
+    thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+  }
+  cacheThumbnail(imageId, thumbnail)
+  await putImageThumbnail({
+    id: imageId,
+    thumbnailDataUrl,
+    thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+  })
+}
+
+async function executeSaasTask(taskId: string, task: TaskRecord) {
+  try {
+    const result = await createSaasTask({
+      clientTaskId: task.id,
+      prompt: replaceImageMentionsForApi(task.prompt, task.inputImageIds.length),
+      params: task.params,
+      inputImageIds: task.inputImageIds,
+      maskImageId: task.maskImageId ?? null,
+      providerProfileId: task.apiProfileId ?? null,
+    })
+    const latest = useStore.getState().tasks.find((t) => t.id === taskId)
+    if (!latest || latest.status !== 'running') return
+    updateTaskInStore(taskId, {
+      ...result.task,
+      status: result.task.status,
+      error: result.task.error ?? null,
+      falRecoverable: false,
+      customRecoverable: false,
+    })
+    startSaasTaskEvents()
+    void reconcileSaasTasks()
+  } catch (error) {
+    if (error instanceof SaasApiError && error.task) {
+      updateTaskInStore(taskId, {
+        ...error.task,
+        status: 'error',
+        error: error.task.error ?? error.message,
+        finishedAt: error.task.finishedAt ?? Date.now(),
+        elapsed: error.task.elapsed ?? (Date.now() - task.createdAt),
+      })
+    } else {
+      updateTaskInStore(taskId, {
+        status: 'error',
+        error: error instanceof Error ? error.message : String(error),
+        finishedAt: Date.now(),
+        elapsed: Date.now() - task.createdAt,
+      })
+    }
+    useStore.getState().setDetailTaskId(taskId)
+  } finally {
+    for (const imgId of task.inputImageIds) imageCache.delete(imgId)
   }
 }
 

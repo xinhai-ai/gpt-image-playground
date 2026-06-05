@@ -3,13 +3,20 @@
   "private": true,
   "version": "0.5.5",
   "type": "module",
+  "packageManager": "pnpm@10.33.0",
   "scripts": {
     "dev": "vite",
+    "dev:api": "pnpm --filter @gpt-image-playground/api dev",
+    "dev:full": "pnpm --parallel --filter gpt-image-playground --filter @gpt-image-playground/api dev",
     "mock:api": "node scripts/mock-image-api.mjs",
     "build": "tsc -b && vite build",
-    "deploy:cf": "npm run build && wrangler deploy",
+    "build:api": "pnpm --filter @gpt-image-playground/api build",
+    "build:all": "pnpm build && pnpm build:api",
+    "deploy:cf": "pnpm build && wrangler deploy",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:api": "pnpm --filter @gpt-image-playground/api test",
+    "test:all": "pnpm test && pnpm test:api",
     "test:watch": "vitest"
   },
   "dependencies": {

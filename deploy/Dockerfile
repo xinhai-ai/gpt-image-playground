@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM --platform=$BUILDPLATFORM node:20-alpine AS build
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build
 
 WORKDIR /app
 
@@ -8,12 +8,15 @@ ENV VITE_API_PROXY_AVAILABLE=__VITE_API_PROXY_AVAILABLE_PLACEHOLDER__
 ENV VITE_API_PROXY_LOCKED=__VITE_API_PROXY_LOCKED_PLACEHOLDER__
 ENV VITE_DOCKER_DEPLOYMENT=__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__
 ENV VITE_DOCKER_LEGACY_API_URL_USED=__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__
+ENV VITE_API_BASE_URL=__VITE_API_BASE_URL_PLACEHOLDER__
 
-COPY package.json package-lock.json ./
-RUN npm ci
+RUN corepack enable
 
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY apps/api/package.json apps/api/package.json
+RUN pnpm install --frozen-lockfile --filter gpt-image-playground...
 COPY . .
-RUN npm run build
+RUN pnpm build
 
 # ---- Production stage ----
 FROM nginx:alpine
@@ -24,6 +27,8 @@ ENV DEFAULT_API_URL=
 ENV API_PROXY_URL=
 ENV ENABLE_API_PROXY=false
 ENV LOCK_API_PROXY=false
+ENV API_BASE_URL=
+ENV API_UPSTREAM_URL=
 
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY deploy/nginx.conf /etc/nginx/templates/default.conf.template

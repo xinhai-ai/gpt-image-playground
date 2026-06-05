@@ -29,6 +29,7 @@ import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiP
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { DEFAULT_DROPDOWN_MAX_HEIGHT, getDropdownMaxHeight } from '../lib/dropdown'
+import { createSaasProviderProfile, deleteSaasProviderProfile, isSaasMode, saasProviderProfileToApiProfile, updateSaasProviderProfile } from '../lib/saasApi'
 import Select from './Select'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
@@ -406,6 +407,18 @@ export default function SettingsModal() {
     ? `已开启 ${enabledZipDownloadRouteCount} 项使用压缩包进行批量下载的途径`
     : '未开启任何使用压缩包进行批量下载的途径'
 
+  const sanitizeSaasSettings = (nextSettings: AppSettings) => normalizeSettings({
+    ...nextSettings,
+    profiles: nextSettings.profiles.map((profile) => ({ ...profile, apiKey: '' })),
+  })
+
+  const applyDraftSettings = (nextSettings: AppSettings) => {
+    const normalized = normalizeSettings(nextSettings)
+    setDraft(normalized)
+    setSettings(normalized)
+    setTimeoutInput(String(getActiveApiProfile(normalized).timeout))
+  }
+
   const wasSettingsOpenRef = useRef(false)
 
   useEffect(() => {
@@ -542,8 +555,17 @@ export default function SettingsModal() {
         ? nextDraft.activeProfileId
         : (normalizedProfiles[0]?.id ?? fallbackProfile.id),
     })
-    setDraft(normalizedDraft)
-    setSettings(normalizedDraft)
+    if (isSaasMode()) {
+      const active = normalizedDraft.profiles.find((profile) => profile.id === normalizedDraft.activeProfileId) ?? normalizedDraft.profiles[0]
+      if (active) {
+        void updateSaasProviderProfile(active.id, active).catch((error) => {
+          showToast(`保存服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+        })
+      }
+      applyDraftSettings(sanitizeSaasSettings(normalizedDraft))
+      return
+    }
+    applyDraftSettings(normalizedDraft)
   }
 
   const setZipDownloadRouteEnabled = (route: ZipDownloadRoute, enabled: boolean) => {
@@ -750,9 +772,24 @@ export default function SettingsModal() {
     setShowProfileMenu(false)
   }
 
-  const createNewProfile = () => {
+  const createNewProfile = async () => {
     setReusedTaskApiProfile(null)
     const profile = createDefaultOpenAIProfile({ id: newId('openai'), name: '新配置' })
+    if (isSaasMode()) {
+      setShowProfileMenu(false)
+      try {
+        const created = await createSaasProviderProfile(profile)
+        const serverProfile = saasProviderProfileToApiProfile(created.providerProfile)
+        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
+          ...draft,
+          profiles: [...draft.profiles, serverProfile],
+          activeProfileId: serverProfile.id,
+        })))
+      } catch (error) {
+        showToast(`创建服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+      }
+      return
+    }
     const nextDraft = normalizeSettings({ 
         ...draft, 
         profiles: [...draft.profiles, profile],
@@ -762,13 +799,29 @@ export default function SettingsModal() {
     setShowProfileMenu(false)
   }
 
-  const duplicateActiveProfile = () => {
+  const duplicateActiveProfile = async () => {
     setReusedTaskApiProfile(null)
     setDuplicateProfileTooltipVisible(false)
     const profile: ApiProfile = {
       ...activeProfile,
       id: newId(activeProfile.provider === 'openai' ? 'openai' : 'profile'),
       name: `${activeProfile.name}（复制）`,
+      apiKey: '',
+    }
+    if (isSaasMode()) {
+      setShowProfileMenu(false)
+      try {
+        const created = await createSaasProviderProfile(profile)
+        const serverProfile = saasProviderProfileToApiProfile(created.providerProfile)
+        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
+          ...draft,
+          profiles: [...draft.profiles, serverProfile],
+          activeProfileId: serverProfile.id,
+        })))
+      } catch (error) {
+        showToast(`复制服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+      }
+      return
     }
     const nextDraft = normalizeSettings({
       ...draft,
@@ -923,8 +976,24 @@ export default function SettingsModal() {
     handleProfileDragEnd()
   }
 
-  const deleteProfile = (id: string) => {
+  const deleteProfile = async (id: string) => {
     if (draft.profiles.length <= 1) return
+    if (isSaasMode()) {
+      try {
+        await deleteSaasProviderProfile(id)
+        if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
+        const nextProfiles = draft.profiles.filter((item) => item.id !== id)
+        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
+          ...draft,
+          profiles: nextProfiles,
+          activeProfileId: draft.activeProfileId === id ? nextProfiles[0].id : draft.activeProfileId,
+        })))
+        showToast('配置已删除', 'success')
+      } catch (error) {
+        showToast(`删除服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+      }
+      return
+    }
     if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
     const nextProfiles = draft.profiles.filter((item) => item.id !== id)
     const nextDraft = normalizeSettings({
@@ -1466,7 +1535,7 @@ export default function SettingsModal() {
                     <span className="relative inline-flex">
                       <button
                         type="button"
-                        onClick={duplicateActiveProfile}
+                        onClick={() => { void duplicateActiveProfile() }}
                         onMouseEnter={() => setDuplicateProfileTooltipVisible(true)}
                         onMouseLeave={() => setDuplicateProfileTooltipVisible(false)}
                         onFocus={() => setDuplicateProfileTooltipVisible(true)}
@@ -1520,7 +1589,7 @@ export default function SettingsModal() {
                             type="button"
                             onClick={(e) => {
                               e.preventDefault()
-                              createNewProfile()
+                              void createNewProfile()
                             }}
                             className="flex w-full cursor-pointer items-center justify-between gap-2 px-3 py-2 text-left text-xs font-medium text-blue-600 transition-colors hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-500/10"
                           >
@@ -1596,7 +1665,7 @@ export default function SettingsModal() {
                                         setConfirmDialog({
                                           title: '删除配置',
                                           message: `确定要删除配置「${profile.name}」吗？`,
-                                          action: () => deleteProfile(profile.id)
+                                          action: () => { void deleteProfile(profile.id) }
                                         })
                                       }}
                                       className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-gray-400 opacity-60 transition-all hover:bg-red-50 hover:text-red-500 hover:opacity-100 dark:hover:bg-red-500/10"

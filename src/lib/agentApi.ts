@@ -1,11 +1,13 @@
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiProfile, type AppSettings, type ResponsesApiResponse, type ResponsesOutputItem, type TaskParams } from '../types'
 import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
 import { getApiErrorMessage, MIME_MAP, normalizeBase64Image, pickActualParams } from './imageApiShared'
+import { isSaasMode, saasRequest } from './saasApi'
 
 export interface AgentApiMessage {
   role: 'user' | 'assistant'
   text: string
   imageDataUrls?: string[]
+  imageIds?: string[]
 }
 
 export interface AgentApiResultImage {
@@ -75,6 +77,13 @@ const AGENT_TITLE_INSTRUCTIONS = [
 
 const AGENT_TITLE_MAX_LENGTH = 28
 
+type AgentInputContentPart = {
+  type: string
+  text?: string
+  image_url?: string
+  image_id?: string
+}
+
 function createHeaders(profile: ApiProfile): Record<string, string> {
   return {
     Authorization: `Bearer ${profile.apiKey}`,
@@ -82,7 +91,20 @@ function createHeaders(profile: ApiProfile): Record<string, string> {
   }
 }
 
-function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: string): Record<string, unknown> {
+async function callSaasResponsesProxy(profile: ApiProfile, body: Record<string, unknown>, signal?: AbortSignal): Promise<ResponsesApiResponse> {
+  const proxiedBody = { ...body }
+  delete proxiedBody.stream
+  return saasRequest<ResponsesApiResponse>('/agent/responses', {
+    method: 'POST',
+    body: JSON.stringify({
+      providerProfileId: profile.id,
+      body: proxiedBody,
+    }),
+    signal,
+  })
+}
+
+function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: string, maskImageId?: string): Record<string, unknown> {
   const tool: Record<string, unknown> = {
     type: 'image_generation',
     action: 'auto',
@@ -101,7 +123,11 @@ function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: 
     tool.partial_images = profile.streamPartialImages ?? DEFAULT_STREAM_PARTIAL_IMAGES
   }
 
-  if (maskDataUrl) {
+  if (isSaasMode() && maskImageId) {
+    tool.input_image_mask = {
+      image_id: maskImageId,
+    }
+  } else if (maskDataUrl) {
     tool.input_image_mask = {
       image_url: maskDataUrl,
     }
@@ -110,8 +136,8 @@ function createImageTool(params: TaskParams, profile: ApiProfile, maskDataUrl?: 
   return tool
 }
 
-function createAgentTools(params: TaskParams, profile: ApiProfile, settings: AppSettings, maskDataUrl?: string): Array<Record<string, unknown>> {
-  const tools: Array<Record<string, unknown>> = [createImageTool(params, profile, maskDataUrl)]
+function createAgentTools(params: TaskParams, profile: ApiProfile, settings: AppSettings, maskDataUrl?: string, maskImageId?: string): Array<Record<string, unknown>> {
+  const tools: Array<Record<string, unknown>> = [createImageTool(params, profile, maskDataUrl, maskImageId)]
 
   // generate_image_batch: custom function tool for concurrent multi-image generation
   tools.push({
@@ -336,13 +362,19 @@ async function readJsonServerSentEvents(response: Response, onEvent: (event: Rec
 
 function createInput(messages: AgentApiMessage[]) {
   return messages.map((message) => {
-    const content: Array<Record<string, string>> = [
+    const content: AgentInputContentPart[] = [
       { type: message.role === 'user' ? 'input_text' : 'output_text', text: message.text },
     ]
 
     if (message.role === 'user') {
-      for (const dataUrl of message.imageDataUrls ?? []) {
-        content.push({ type: 'input_image', image_url: dataUrl })
+      if (isSaasMode()) {
+        for (const imageId of message.imageIds ?? []) {
+          content.push({ type: 'input_image', image_id: imageId })
+        }
+      } else {
+        for (const dataUrl of message.imageDataUrls ?? []) {
+          content.push({ type: 'input_image', image_url: dataUrl })
+        }
       }
     }
 
@@ -607,6 +639,7 @@ export async function callAgentResponsesApi(opts: {
   params: TaskParams
   input: unknown
   maskDataUrl?: string
+  maskImageId?: string
   signal?: AbortSignal
   onTextDelta?: (delta: string) => void
   onOutputItems?: (outputItems: ResponsesOutputItem[]) => void
@@ -614,7 +647,7 @@ export async function callAgentResponsesApi(opts: {
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
 }): Promise<AgentApiResult> {
-  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
+  const { settings, profile, params, input, maskDataUrl, maskImageId, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -629,10 +662,23 @@ export async function callAgentResponsesApi(opts: {
       model: profile.model || settings.model,
       instructions: createAgentInstructions(settings),
       input,
-      tools: createAgentTools(params, profile, settings, maskDataUrl),
+      tools: createAgentTools(params, profile, settings, maskDataUrl, maskImageId),
     }
     if (profile.streamImages) {
       body.stream = true
+    }
+
+    if (isSaasMode()) {
+      const payload = await callSaasResponsesProxy(profile, body, controller.signal)
+      throwIfAborted(controller.signal, signal)
+      onOutputItems?.(payload.output ?? [])
+      return {
+        responseId: payload.id,
+        text: extractText(payload),
+        images: extractImages(payload, mime),
+        outputItems: payload.output,
+        rawResponsePayload: JSON.stringify(payload, null, 2),
+      }
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
@@ -671,9 +717,10 @@ export async function callAgentConversationTitleApi(opts: {
   profile: ApiProfile
   prompt: string
   imageDataUrls?: string[]
+  imageIds?: string[]
   signal?: AbortSignal
 }): Promise<string> {
-  const { settings, profile, prompt, imageDataUrls, signal } = opts
+  const { settings, profile, prompt, imageDataUrls, imageIds, signal } = opts
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
   const controller = new AbortController()
@@ -683,23 +730,36 @@ export async function callAgentConversationTitleApi(opts: {
   signal?.addEventListener('abort', abortFromCaller, { once: true })
 
   try {
-    const content: Array<Record<string, string>> = [
+    const content: AgentInputContentPart[] = [
       { type: 'input_text', text: `The following is the first message the user sent in a conversation. Generate a title for this conversation.\n\n${prompt}` },
     ]
-    for (const dataUrl of imageDataUrls ?? []) {
-      content.push({ type: 'input_image', image_url: dataUrl })
+    if (isSaasMode()) {
+      for (const imageId of imageIds ?? []) {
+        content.push({ type: 'input_image', image_id: imageId })
+      }
+    } else {
+      for (const dataUrl of imageDataUrls ?? []) {
+        content.push({ type: 'input_image', image_url: dataUrl })
+      }
+    }
+
+    const body = {
+      model: profile.model || settings.model,
+      instructions: AGENT_TITLE_INSTRUCTIONS,
+      input: [{ role: 'user', content }],
+      max_output_tokens: 32,
+    }
+
+    if (isSaasMode()) {
+      const payload = await callSaasResponsesProxy(profile, body, controller.signal)
+      return parseAgentConversationTitleXml(extractText(payload))
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
       method: 'POST',
       headers: createHeaders(profile),
       cache: 'no-store',
-      body: JSON.stringify({
-        model: profile.model || settings.model,
-        instructions: AGENT_TITLE_INSTRUCTIONS,
-        input: [{ role: 'user', content }],
-        max_output_tokens: 32,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     })
 
@@ -742,14 +802,15 @@ export async function callBatchImageSingle(opts: {
   params: TaskParams
   batchItemId: string
   prompt: string
-  referenceImageDataUrls: string[]
+  referenceImageDataUrls?: string[]
+  referenceImageIds?: string[]
   referenceIds?: string[]
   signal?: AbortSignal
   onImageToolStarted?: () => void | Promise<void>
   onPartialImage?: (event: { image: string; partialImageIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
 }): Promise<BatchImageCallResult> {
-  const { profile, params, batchItemId, prompt, referenceImageDataUrls, referenceIds, signal, onImageToolStarted, onPartialImage, onImageToolCompleted } = opts
+  const { profile, params, batchItemId, prompt, referenceImageDataUrls = [], referenceImageIds = [], referenceIds, signal, onImageToolStarted, onPartialImage, onImageToolCompleted } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -761,20 +822,27 @@ export async function callBatchImageSingle(opts: {
 
   try {
     // Build input: reference id mapping + prompt-rewrite guard + reference images.
-    const referenceMapping = referenceImageDataUrls.length > 0
+    const useImageIds = isSaasMode()
+    const referenceCount = useImageIds ? referenceImageIds.length : referenceImageDataUrls.length
+    const referenceMapping = referenceCount > 0
       ? `Attached reference images correspond to these ids, in order: ${(referenceIds ?? []).map((id) => `<ref id="${id}" />`).join(', ') || 'reference images'}.`
       : ''
     const guardedPrompt = [referenceMapping, `${PROMPT_REWRITE_GUARD_PREFIX}\n${prompt}`].filter(Boolean).join('\n\n')
     let input: unknown
-    if (referenceImageDataUrls.length > 0) {
+    if (referenceCount > 0) {
       input = [{
         role: 'user',
         content: [
           { type: 'input_text', text: guardedPrompt },
-          ...referenceImageDataUrls.map((dataUrl) => ({
-            type: 'input_image',
-            image_url: dataUrl,
-          })),
+          ...(useImageIds
+            ? referenceImageIds.map((imageId) => ({
+                type: 'input_image',
+                image_id: imageId,
+              }))
+            : referenceImageDataUrls.map((dataUrl) => ({
+                type: 'input_image',
+                image_url: dataUrl,
+              }))),
         ],
       }]
     } else {
@@ -784,7 +852,7 @@ export async function callBatchImageSingle(opts: {
     // Build image_generation tool with current params
     const tool: Record<string, unknown> = {
       type: 'image_generation',
-      action: referenceImageDataUrls.length > 0 ? 'auto' : 'generate',
+      action: referenceCount > 0 ? 'auto' : 'generate',
       size: params.size,
       output_format: params.output_format,
       moderation: params.moderation,
@@ -805,6 +873,29 @@ export async function callBatchImageSingle(opts: {
     }
     if (profile.streamImages) {
       body.stream = true
+    }
+
+    if (isSaasMode()) {
+      try {
+        await onImageToolStarted?.()
+        const payload = await callSaasResponsesProxy(profile, body, controller.signal)
+        throwIfAborted(controller.signal, signal)
+        const images = extractImages(payload, mime)
+        const image = images[0] ?? null
+        if (image) await onImageToolCompleted?.(image)
+        return {
+          batchItemId,
+          image,
+          error: image ? null : '接口未返回图片',
+          rawResponsePayload: JSON.stringify(payload, null, 2),
+        }
+      } catch (error) {
+        return {
+          batchItemId,
+          image: null,
+          error: error instanceof Error ? error.message : String(error),
+        }
+      }
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
