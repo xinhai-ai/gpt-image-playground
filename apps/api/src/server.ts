@@ -3,7 +3,8 @@ import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import staticPlugin from '@fastify/static'
-import { APIError, serializeCookie, serializeSignedCookie, type CookieOptions } from 'better-auth'
+import { APIError } from 'better-auth'
+import { serializeCookie, serializeSignedCookie, type CookieOptions } from 'better-call'
 import {
   ImagePurpose,
   ImageStatus,
