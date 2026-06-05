@@ -26,12 +26,7 @@ export interface SaasSession {
     id: string
     name: string
     provider: string
-    baseUrl: string
     model: string
-    apiMode: string
-    config?: unknown
-    hasApiKey?: boolean
-    disabledAt?: string | null
   }>
 }
 
@@ -296,32 +291,21 @@ export function getGoogleOAuthStartUrl(redirectPath = '/'): string {
   return buildUrl(`/auth/google/start${suffix ? `?${suffix}` : ''}`)
 }
 
-function readProviderConfig(profile: SaasProviderProfile): Record<string, unknown> {
-  return profile.config && typeof profile.config === 'object' && !Array.isArray(profile.config)
-    ? profile.config as Record<string, unknown>
-    : {}
-}
-
 export function saasProviderProfileToApiProfile(profile: SaasProviderProfile): ApiProfile {
-  const config = readProviderConfig(profile)
-  const timeout = typeof config.timeout === 'number' && Number.isFinite(config.timeout) ? config.timeout : 600
-  const streamPartialImages = typeof config.streamPartialImages === 'number' && Number.isFinite(config.streamPartialImages)
-    ? config.streamPartialImages
-    : 1
   return {
     id: profile.id,
     name: profile.name,
     provider: profile.provider,
-    baseUrl: profile.baseUrl,
+    baseUrl: '',
     apiKey: '',
     model: profile.model,
-    timeout,
-    apiMode: profile.apiMode === 'responses' ? 'responses' : 'images',
-    codexCli: Boolean(config.codexCli),
+    timeout: 600,
+    apiMode: 'images',
+    codexCli: false,
     apiProxy: false,
-    responseFormatB64Json: Boolean(config.responseFormatB64Json),
-    streamImages: Boolean(config.streamImages),
-    streamPartialImages,
+    responseFormatB64Json: false,
+    streamImages: false,
+    streamPartialImages: 1,
   }
 }
 

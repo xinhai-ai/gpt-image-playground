@@ -110,9 +110,18 @@ describeWithDb('provider profile routes', () => {
       headers: { cookie: session.cookie },
     })
     expect(me.statusCode).toBe(200)
-    const mePayload = me.json() as { providerProfiles: Array<{ id: string; hasApiKey: boolean; apiKey?: string; apiKeyEncrypted?: string }> }
+    const mePayload = me.json() as { providerProfiles: Array<Record<string, unknown>> }
     const profile = mePayload.providerProfiles.find((item) => item.id === createdPayload.channel.id)
-    expect(profile?.hasApiKey).toBe(true)
+    expect(profile).toMatchObject({
+      id: createdPayload.channel.id,
+      name: 'Renamed OpenAI',
+      provider: 'openai',
+      model: 'gpt-image-2',
+    })
+    expect(profile?.baseUrl).toBeUndefined()
+    expect(profile?.apiMode).toBeUndefined()
+    expect(profile?.config).toBeUndefined()
+    expect(profile?.hasApiKey).toBeUndefined()
     expect(profile?.apiKey).toBeUndefined()
     expect(profile?.apiKeyEncrypted).toBeUndefined()
   })

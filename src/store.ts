@@ -3743,7 +3743,7 @@ export async function submitAgentMessage() {
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
-  if (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses') {
+  if (activeProfile.provider !== 'openai' || (!isSaasMode() && activeProfile.apiMode !== 'responses')) {
     state.setAppMode('agent')
     return
   }
@@ -3893,7 +3893,7 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
   const normalizedSettings = normalizeSettings(settings)
   const activeProfile = getActiveApiProfile(normalizedSettings)
 
-  if (activeProfile.provider !== 'openai' || activeProfile.apiMode !== 'responses') {
+  if (activeProfile.provider !== 'openai' || (!isSaasMode() && activeProfile.apiMode !== 'responses')) {
     state.setAppMode('agent')
     return
   }

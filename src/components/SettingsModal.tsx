@@ -1659,7 +1659,7 @@ export default function SettingsModal() {
                 <div className="rounded-2xl border border-gray-100 bg-gray-50/70 p-4 text-sm text-gray-600 dark:border-white/[0.06] dark:bg-white/[0.03] dark:text-gray-300">
                   <div className="font-medium text-gray-800 dark:text-gray-100">{activeProfile.name}</div>
                   <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                    {getApiProviderLabel(draft, activeProfile.provider)} / {activeProfile.model || '-'} / {activeProfile.apiMode === 'responses' ? 'Responses API' : 'Images API'}
+                    {getApiProviderLabel(draft, activeProfile.provider)} / {activeProfile.model || '-'}
                   </div>
                   <div className="mt-3 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
                     渠道参数由平台管理员统一配置，当前账号只保存所选渠道。

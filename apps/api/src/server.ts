@@ -439,6 +439,15 @@ function serializeProviderProfile(profile: ProviderProfile) {
     id: profile.id,
     name: profile.name,
     provider: profile.provider,
+    model: profile.model,
+  }
+}
+
+function serializeAdminChannel(profile: ProviderProfile & { _count?: { tasks: number } }) {
+  return {
+    id: profile.id,
+    name: profile.name,
+    provider: profile.provider,
     baseUrl: profile.baseUrl,
     model: profile.model,
     apiMode: profile.apiMode,
@@ -447,12 +456,6 @@ function serializeProviderProfile(profile: ProviderProfile) {
     disabledAt: profile.disabledAt?.toISOString() ?? null,
     createdAt: profile.createdAt.toISOString(),
     updatedAt: profile.updatedAt.toISOString(),
-  }
-}
-
-function serializeAdminChannel(profile: ProviderProfile & { _count?: { tasks: number } }) {
-  return {
-    ...serializeProviderProfile(profile),
     taskCount: profile._count?.tasks ?? 0,
   }
 }
@@ -486,7 +489,6 @@ function serializeTask(task: TaskWithRelations) {
     apiProvider: task.provider,
     apiProfileId: task.providerProfileId ?? undefined,
     apiProfileName: task.providerProfile?.name,
-    apiMode: task.providerProfile?.apiMode,
     apiModel: task.providerProfile?.model,
     inputImageIds,
     maskTargetImageId: inputImageIds[0] ?? null,
