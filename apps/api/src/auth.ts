@@ -7,7 +7,7 @@ import { hashPassword, normalizeEmail, verifyPassword } from './crypto.js'
 import { prisma } from './prisma.js'
 
 export const BETTER_AUTH_BASE_PATH = '/api/auth/better'
-export const SESSION_COOKIE = 'gip_session'
+export const SESSION_COOKIE = config.sessionCookieName
 
 function githubOAuthConfig() {
   return {

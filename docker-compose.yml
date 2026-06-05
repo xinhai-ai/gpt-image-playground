@@ -1,51 +1,70 @@
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: apps/api/Dockerfile
+  environment: &api-environment
+    HOST: 0.0.0.0
+    PORT: 3001
+    STATIC_DIR: /app/public
+    SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-change-me}
+    PROVIDER_KEY_ENCRYPTION_SECRET: ${PROVIDER_KEY_ENCRYPTION_SECRET:-dev-provider-secret-change-me}
+    ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+    GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+    GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+    GITHUB_CALLBACK_URL: ${GITHUB_CALLBACK_URL:-}
+    ALLOW_PRIVATE_PROVIDER_URLS: ${ALLOW_PRIVATE_PROVIDER_URLS:-false}
+    RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+    IMAGE_MAX_UPLOAD_BYTES: ${IMAGE_MAX_UPLOAD_BYTES:-67108864}
+    IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-67108864}
+    TASK_WORKER_CONCURRENCY: ${TASK_WORKER_CONCURRENCY:-2}
+    TASK_WORKER_LEASE_SECONDS: ${TASK_WORKER_LEASE_SECONDS:-1800}
+    TASK_WORKER_RECOVER_INTERVAL_SECONDS: ${TASK_WORKER_RECOVER_INTERVAL_SECONDS:-60}
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+    S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-${S3_ENDPOINT:-http://localhost:9000}}
+    S3_REGION: ${S3_REGION:-us-east-1}
+    S3_BUCKET: ${S3_BUCKET:-gpt-image-assets}
+    S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+    S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
+    S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+    PUBLIC_IMAGE_BASE_URL: ${PUBLIC_IMAGE_BASE_URL:-}
+    PUBLIC_THUMBNAIL_READS: ${PUBLIC_THUMBNAIL_READS:-false}
+    PUBLIC_ORIGINAL_READS: ${PUBLIC_ORIGINAL_READS:-false}
+    DEFAULT_PROVIDER_NAME: OpenAI
+    DEFAULT_PROVIDER: openai
+    DEFAULT_PROVIDER_BASE_URL: https://api.openai.com/v1
+    DEFAULT_PROVIDER_MODEL: gpt-image-2
+    DEFAULT_PROVIDER_API_MODE: images
+    DEFAULT_PROVIDER_API_KEY: ${OPENAI_API_KEY:-}
+  restart: unless-stopped
+
 services:
-  api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
+  api-prod:
+    <<: *api-common
     ports:
-      - "${WEB_PORT:-8080}:3001"
+      - "28080:3001"
     environment:
-      HOST: 0.0.0.0
-      PORT: 3001
-      STATIC_DIR: /app/public
-      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-${WEB_ORIGIN:-http://localhost:8080}}
-      DATABASE_URL: postgresql://gpt_image:gpt_image@postgres:5432/gpt_image
-      SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-change-me}
-      PROVIDER_KEY_ENCRYPTION_SECRET: ${PROVIDER_KEY_ENCRYPTION_SECRET:-dev-provider-secret-change-me}
-      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
-      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
-      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
-      GITHUB_CALLBACK_URL: ${GITHUB_CALLBACK_URL:-}
-      ALLOW_PRIVATE_PROVIDER_URLS: ${ALLOW_PRIVATE_PROVIDER_URLS:-false}
-      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
-      IMAGE_MAX_UPLOAD_BYTES: ${IMAGE_MAX_UPLOAD_BYTES:-67108864}
-      IMAGE_MAX_PIXELS: ${IMAGE_MAX_PIXELS:-67108864}
-      TASK_WORKER_CONCURRENCY: ${TASK_WORKER_CONCURRENCY:-2}
-      TASK_WORKER_LEASE_SECONDS: ${TASK_WORKER_LEASE_SECONDS:-1800}
-      TASK_WORKER_RECOVER_INTERVAL_SECONDS: ${TASK_WORKER_RECOVER_INTERVAL_SECONDS:-60}
-      COOKIE_SECURE: "false"
-      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-${S3_ENDPOINT:-http://localhost:9000}}
-      S3_REGION: ${S3_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-gpt-image-assets}
-      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
-      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin}
-      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
-      PUBLIC_IMAGE_BASE_URL: ${PUBLIC_IMAGE_BASE_URL:-}
-      PUBLIC_THUMBNAIL_READS: ${PUBLIC_THUMBNAIL_READS:-false}
-      PUBLIC_ORIGINAL_READS: ${PUBLIC_ORIGINAL_READS:-false}
-      DEFAULT_PROVIDER_NAME: OpenAI
-      DEFAULT_PROVIDER: openai
-      DEFAULT_PROVIDER_BASE_URL: https://api.openai.com/v1
-      DEFAULT_PROVIDER_MODEL: gpt-image-2
-      DEFAULT_PROVIDER_API_MODE: images
-      DEFAULT_PROVIDER_API_KEY: ${OPENAI_API_KEY:-}
+      <<: *api-environment
+      WEB_ORIGIN: ${PROD_WEB_ORIGIN:-http://localhost:28080,http://127.0.0.1:28080}
+      BETTER_AUTH_URL: ${PROD_BETTER_AUTH_URL:-http://localhost:28080}
+      DATABASE_URL: ${PROD_DATABASE_URL:?Set PROD_DATABASE_URL in .env for production}
+      SESSION_COOKIE_NAME: ${PROD_SESSION_COOKIE_NAME:-gip_session}
+    networks:
+      - prod-external
+
+  api-test:
+    <<: *api-common
+    ports:
+      - "28081:3001"
+    environment:
+      <<: *api-environment
+      WEB_ORIGIN: ${TEST_WEB_ORIGIN:-http://localhost:28081,http://127.0.0.1:28081}
+      BETTER_AUTH_URL: ${TEST_BETTER_AUTH_URL:-http://localhost:28081}
+      DATABASE_URL: ${TEST_DATABASE_URL:-postgresql://gpt_image:gpt_image@postgres:5432/gpt_image}
+      SESSION_COOKIE_NAME: ${TEST_SESSION_COOKIE_NAME:-gip_test_session}
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
@@ -78,3 +97,8 @@ services:
 volumes:
   postgres-data:
   minio-data:
+
+networks:
+  prod-external:
+    name: 1panel-network
+    external: true

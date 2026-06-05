@@ -26,6 +26,7 @@ export const config = {
     .filter(Boolean),
   betterAuthUrl: readEnv('BETTER_AUTH_URL', readEnv('WEB_ORIGIN', 'http://localhost:5173').split(',')[0]?.trim() || 'http://localhost:5173'),
   cookieSecure: readBoolean('COOKIE_SECURE', false),
+  sessionCookieName: readEnv('SESSION_COOKIE_NAME', 'gip_session'),
   sessionTtlSeconds: readNumber('SESSION_TTL_SECONDS', 60 * 60 * 24 * 30),
   sessionSecret: readEnv('SESSION_SECRET', 'dev-session-secret-change-me'),
   providerKeyEncryptionSecret: readEnv('PROVIDER_KEY_ENCRYPTION_SECRET', readEnv('SESSION_SECRET', 'dev-provider-secret-change-me')),
