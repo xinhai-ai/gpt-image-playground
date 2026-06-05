@@ -3,7 +3,7 @@ import cookie from '@fastify/cookie'
 import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import staticPlugin from '@fastify/static'
-import { APIError } from 'better-auth'
+import { APIError, serializeCookie, serializeSignedCookie, type CookieOptions } from 'better-auth'
 import {
   ImagePurpose,
   ImageStatus,
@@ -26,9 +26,9 @@ import path from 'node:path'
 import { z } from 'zod'
 import {
   BETTER_AUTH_BASE_PATH,
-  SESSION_COOKIE,
   betterAuthHeaders,
   createBetterAuth,
+  getBetterAuthCookies,
   githubOAuthEnabled,
   googleOAuthEnabled,
   parseBetterAuthJson,
@@ -52,11 +52,6 @@ const TASK_EVENT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
 const TASK_EVENT_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 const TASK_WORKER_ID = `api-${randomUUID()}`
 const CLIENT_PREFERENCES_KEY = 'client'
-const AUTH_COOKIE_CLEAR_OPTIONS = {
-  path: '/',
-  sameSite: 'lax' as const,
-  secure: config.cookieSecure,
-}
 
 type ProviderTaskEventPhase = ProviderProgressEvent['phase']
 type TaskEventPhase = 'queued' | 'started' | ProviderTaskEventPhase | 'archiving' | 'done' | 'error'
@@ -626,12 +621,24 @@ function betterAuthInstance(): AppAuth {
   return activeBetterAuth
 }
 
+function expiredCookieHeader(name: string, attributes: CookieOptions): string {
+  return serializeCookie(name, '', {
+    ...attributes,
+    maxAge: 0,
+  })
+}
+
 function clearBetterAuthCookies(reply: FastifyReply): void {
-  reply.clearCookie(SESSION_COOKIE, AUTH_COOKIE_CLEAR_OPTIONS)
-  reply.clearCookie(`${SESSION_COOKIE}_data`, AUTH_COOKIE_CLEAR_OPTIONS)
+  const authCookies = getBetterAuthCookies()
+  reply.header('Set-Cookie', [
+    expiredCookieHeader(authCookies.sessionToken.name, authCookies.sessionToken.attributes),
+    expiredCookieHeader(authCookies.sessionData.name, authCookies.sessionData.attributes),
+    expiredCookieHeader(authCookies.dontRememberToken.name, authCookies.dontRememberToken.attributes),
+  ])
 }
 
 async function createSessionCookieForUser(request: FastifyRequest, reply: FastifyReply, userId: string): Promise<void> {
+  const authCookies = getBetterAuthCookies()
   const token = randomBytes(32).toString('base64url')
   const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000)
   await prisma.session.create({
@@ -645,15 +652,15 @@ async function createSessionCookieForUser(request: FastifyRequest, reply: Fastif
       userAgent: requestUserAgent(request),
     },
   })
-  reply.setCookie(SESSION_COOKIE, token, {
-    path: '/',
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: config.cookieSecure,
-    expires: expiresAt,
+  const sessionCookie = await serializeSignedCookie(authCookies.sessionToken.name, token, config.sessionSecret, {
+    ...authCookies.sessionToken.attributes,
     maxAge: config.sessionTtlSeconds,
   })
-  reply.clearCookie(`${SESSION_COOKIE}_data`, AUTH_COOKIE_CLEAR_OPTIONS)
+  reply.header('Set-Cookie', [
+    sessionCookie,
+    expiredCookieHeader(authCookies.sessionData.name, authCookies.sessionData.attributes),
+    expiredCookieHeader(authCookies.dontRememberToken.name, authCookies.dontRememberToken.attributes),
+  ])
 }
 
 function requestUserAgent(request: FastifyRequest): string | null {

@@ -1,5 +1,6 @@
-import { betterAuth, APIError } from 'better-auth'
+import { betterAuth, APIError, type BetterAuthOptions } from 'better-auth'
 import { prismaAdapter } from 'better-auth/adapters/prisma'
+import { getCookies } from 'better-auth/cookies'
 import { fromNodeHeaders } from 'better-auth/node'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { config } from './config.js'
@@ -35,7 +36,7 @@ export function googleOAuthEnabled(): boolean {
   return Boolean(oauth.clientId && oauth.clientSecret)
 }
 
-export function createBetterAuth() {
+function betterAuthOptions(): BetterAuthOptions {
   const githubOAuth = githubOAuthConfig()
   const googleOAuth = googleOAuthConfig()
   const socialProviders = {
@@ -60,7 +61,7 @@ export function createBetterAuth() {
       : {}),
   }
 
-  return betterAuth({
+  return {
     appName: 'GPT Image Playground',
     baseURL: config.betterAuthUrl,
     basePath: BETTER_AUTH_BASE_PATH,
@@ -156,7 +157,15 @@ export function createBetterAuth() {
         },
       },
     },
-  })
+  }
+}
+
+export function getBetterAuthCookies() {
+  return getCookies(betterAuthOptions())
+}
+
+export function createBetterAuth() {
+  return betterAuth(betterAuthOptions())
 }
 
 export type AppAuth = ReturnType<typeof createBetterAuth>
