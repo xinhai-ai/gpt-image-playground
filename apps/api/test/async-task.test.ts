@@ -232,6 +232,74 @@ describeWithDb('async SaaS task execution', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it('deletes tasks on the backend and cleans orphaned output records', async () => {
+    const cookie = await register(app)
+    const providerProfileId = await createProvider(app, cookie)
+    vi.stubGlobal('fetch', vi.fn(async (): Promise<Response> => new Response(JSON.stringify({
+      data: [{
+        b64_json: TINY_PNG_BASE64,
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie },
+      payload: {
+        prompt: 'make one image then delete it',
+        params: DEFAULT_TASK_PARAMS,
+        inputImageIds: [],
+        maskImageId: null,
+        providerProfileId,
+      },
+    })
+    expect(created.statusCode).toBe(202)
+    const createdPayload = created.json() as { task: { id: string } }
+    const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
+    expect(doneTask.status).toBe('done')
+    expect(doneTask.outputImages).toHaveLength(1)
+
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: `/api/tasks/${createdPayload.task.id}`,
+      headers: { cookie },
+    })
+    expect(deleted.statusCode).toBe(200)
+    expect(deleted.json()).toMatchObject({
+      ok: true,
+      deletedTaskId: createdPayload.task.id,
+      deletedImageIds: doneTask.outputImages,
+      alreadyDeleted: false,
+    })
+
+    const missing = await app.inject({
+      method: 'GET',
+      url: `/api/tasks/${createdPayload.task.id}`,
+      headers: { cookie },
+    })
+    expect(missing.statusCode).toBe(404)
+    expect(await prisma.taskImage.count({ where: { taskId: createdPayload.task.id } })).toBe(0)
+    expect(await prisma.taskEvent.count({ where: { taskId: createdPayload.task.id } })).toBe(0)
+    expect(await prisma.imageAsset.findUnique({ where: { id: doneTask.outputImages[0]! } })).toBeNull()
+    expect(await prisma.usageLog.count({ where: { action: 'task.delete', targetId: createdPayload.task.id } })).toBe(1)
+
+    const deletedAgain = await app.inject({
+      method: 'DELETE',
+      url: `/api/tasks/${createdPayload.task.id}`,
+      headers: { cookie },
+    })
+    expect(deletedAgain.statusCode).toBe(200)
+    expect(deletedAgain.json()).toMatchObject({
+      ok: true,
+      deletedTaskId: createdPayload.task.id,
+      deletedImageIds: [],
+      alreadyDeleted: true,
+    })
+  })
+
   it('runs Responses image count as concurrent single-image response requests', async () => {
     const cookie = await register(app)
     const providerProfileId = await createProvider(app, cookie, { apiMode: 'responses' })

@@ -2,6 +2,9 @@ import { useMemo, useRef, useState, useEffect } from 'react'
 import { ALL_FAVORITES_COLLECTION_ID, getTaskFavoriteCollectionIds, useStore, reuseConfig, editOutputs, removeTask } from '../store'
 import TaskCard from './TaskCard'
 
+const INITIAL_RENDER_TASK_COUNT = 60
+const RENDER_BATCH_TASK_COUNT = 60
+
 export default function TaskGrid() {
   const tasks = useStore((s) => s.tasks)
   const searchQuery = useStore((s) => s.searchQuery)
@@ -16,6 +19,7 @@ export default function TaskGrid() {
   const rootRef = useRef<HTMLDivElement>(null)
   const gridRef = useRef<HTMLDivElement>(null)
   const [selectionBox, setSelectionBox] = useState<{ startPageX: number; startPageY: number; currentPageX: number; currentPageY: number } | null>(null)
+  const [visibleCount, setVisibleCount] = useState(INITIAL_RENDER_TASK_COUNT)
   const dragStart = useRef<{ pageX: number; pageY: number } | null>(null)
   const lastClientPoint = useRef<{ x: number; y: number } | null>(null)
   const hasDragged = useRef(false)
@@ -47,6 +51,29 @@ export default function TaskGrid() {
       return prompt.includes(q) || paramStr.includes(q)
     })
   }, [tasks, searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
+
+  const visibleTasks = useMemo(() => filteredTasks.slice(0, visibleCount), [filteredTasks, visibleCount])
+  const hasMoreTasks = visibleCount < filteredTasks.length
+
+  useEffect(() => {
+    setVisibleCount(INITIAL_RENDER_TASK_COUNT)
+  }, [searchQuery, filterStatus, filterFavorite, activeFavoriteCollectionId])
+
+  useEffect(() => {
+    if (!hasMoreTasks) return
+    const root = rootRef.current
+    if (!root || typeof IntersectionObserver === 'undefined') return
+    const sentinel = root.querySelector('[data-task-grid-sentinel]')
+    if (!sentinel) return
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return
+      setVisibleCount((count) => Math.min(count + RENDER_BATCH_TASK_COUNT, filteredTasks.length))
+    }, {
+      rootMargin: '900px 0px',
+    })
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [filteredTasks.length, hasMoreTasks])
 
   const handleDelete = (task: typeof tasks[0]) => {
     setConfirmDialog({
@@ -291,7 +318,7 @@ export default function TaskGrid() {
       className="relative min-h-[50vh]"
     >
       <div ref={gridRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pb-10">
-        {filteredTasks.map((task) => (
+        {visibleTasks.map((task) => (
           <div key={task.id} className="task-card-wrapper" data-task-id={task.id}>
             <TaskCard
               task={task}
@@ -317,6 +344,17 @@ export default function TaskGrid() {
           </div>
         ))}
       </div>
+      {hasMoreTasks && (
+        <div data-task-grid-sentinel className="flex justify-center pb-10">
+          <button
+            type="button"
+            className="rounded-md border border-gray-200 bg-white px-4 py-2 text-sm text-gray-600 shadow-sm hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1f1f1f] dark:text-gray-300 dark:hover:bg-[#2a2a2a]"
+            onClick={() => setVisibleCount((count) => Math.min(count + RENDER_BATCH_TASK_COUNT, filteredTasks.length))}
+          >
+            加载更多
+          </button>
+        </div>
+      )}
       {selectionBox && (
         <div
           className="fixed bg-blue-500/20 border border-blue-500/50 pointer-events-none z-[30]"

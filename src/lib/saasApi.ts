@@ -503,11 +503,26 @@ export type SaasTaskEvent = {
   workerId: string
   eventCursor: string | null
   serverTime: number
+} | {
+  type: 'task.deleted'
+  taskId: string
+  serverTime: number
 }
 
 export function createSaasTaskEventSource(cursor?: string | null): EventSource {
   const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
   return new EventSource(buildUrl(`/tasks/events${query}`), { withCredentials: true })
+}
+
+export function deleteSaasTask(taskId: string): Promise<{
+  ok: true
+  deletedTaskId: string
+  deletedImageIds: string[]
+  alreadyDeleted?: boolean
+}> {
+  return saasRequest(`/tasks/${encodeURIComponent(taskId)}`, {
+    method: 'DELETE',
+  })
 }
 
 export function createSaasTask(input: {

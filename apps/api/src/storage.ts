@@ -1,5 +1,6 @@
 import {
   CreateBucketCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   HeadBucketCommand,
@@ -144,6 +145,21 @@ export async function uploadBuffer(image: Pick<ImageAsset, 'bucket' | 'objectKey
     Body: body,
     ContentType: contentType,
   }))
+}
+
+export async function deleteObject(object: Pick<ImageAsset, 'bucket' | 'objectKey'>): Promise<void> {
+  await internalClient.send(new DeleteObjectCommand({
+    Bucket: object.bucket,
+    Key: object.objectKey,
+  }))
+}
+
+export async function deleteImageObjects(image: Pick<ImageAsset, 'id' | 'tenantId' | 'bucket' | 'objectKey'>): Promise<void> {
+  const objectKeys = new Set([image.objectKey, thumbnailObjectKeyForImage(image)])
+  await Promise.all([...objectKeys].map((objectKey) => deleteObject({
+    bucket: image.bucket,
+    objectKey,
+  })))
 }
 
 function contentTypeForFormat(format: NormalizedImageFormat): string {

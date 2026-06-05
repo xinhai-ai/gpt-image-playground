@@ -45,6 +45,7 @@ import { callImageApi } from './lib/api'
 import {
   createSaasTaskEventSource,
   createSaasTask,
+  deleteSaasTask,
   fetchSaasImageDataUrl,
   fetchSaasImageThumbnailDataUrl,
   isSaasMode,
@@ -74,14 +75,20 @@ const imageCache = new Map<string, string>()
 const thumbnailCache = new Map<string, { dataUrl: string; width?: number; height?: number; thumbnailVersion?: number }>()
 const thumbnailBackfillIds = new Map<string, 'visible' | 'background'>()
 const thumbnailBackfillRunningIds = new Set<string>()
+const saasThumbnailFetchIds = new Map<string, 'visible' | 'background'>()
+const saasThumbnailFetchRunningIds = new Set<string>()
 const thumbnailSubscribers = new Map<string, Set<(thumbnail: { dataUrl: string; width?: number; height?: number }) => void>>()
 let thumbnailBackfillScheduled = false
+let saasThumbnailFetchScheduled = false
 const MAX_IMAGE_CACHE_ENTRIES = 8
 const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
+const MAX_SAAS_THUMBNAIL_FETCH_CONCURRENT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SAAS_TASK_EVENT_CURSOR_KEY = 'gpt-image-playground.saas-task-event-cursor'
+const SAAS_LOCAL_PENDING_PRESERVE_MS = 60_000
+const SAAS_FULL_TASK_REFRESH_MIN_INTERVAL_MS = 30_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
@@ -89,6 +96,8 @@ const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let saasTaskEventSource: EventSource | null = null
+let lastSaasFullTaskRefreshAt = 0
+let saasTaskEventsConnectedOnce = false
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -225,23 +234,8 @@ export async function ensureImageThumbnailCached(id: string): Promise<{ dataUrl:
   const rec = await getStoredFreshImageThumbnail(id)
   if (!rec?.thumbnailDataUrl) {
     if (isSaasMode()) {
-      try {
-        const thumbnailDataUrl = await fetchSaasImageThumbnailDataUrl(id)
-        if (!thumbnailDataUrl) return undefined
-        const thumbnail = {
-          dataUrl: thumbnailDataUrl,
-          thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
-        }
-        cacheThumbnail(id, thumbnail)
-        await putImageThumbnail({
-          id,
-          thumbnailDataUrl,
-          thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
-        })
-        return thumbnail
-      } catch {
-        return undefined
-      }
+      scheduleSaasThumbnailFetch([id], 'visible')
+      return undefined
     }
     scheduleThumbnailBackfill([id], 'visible')
     return undefined
@@ -274,6 +268,84 @@ function notifyImageThumbnail(id: string, thumbnail: { dataUrl: string; width?: 
   thumbnailSubscribers.get(id)?.forEach((callback) => callback(thumbnail))
 }
 
+function scheduleIdleTask(callback: () => void, timeout = 2_000) {
+  if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+    window.requestIdleCallback(callback, { timeout })
+  } else {
+    globalThis.setTimeout(callback, 250)
+  }
+}
+
+function scheduleSaasThumbnailFetch(ids: Iterable<string>, priority: 'visible' | 'background' = 'background') {
+  if (!isSaasMode()) return
+  for (const id of ids) {
+    if (!id || getCachedThumbnail(id) || saasThumbnailFetchRunningIds.has(id)) continue
+    const currentPriority = saasThumbnailFetchIds.get(id)
+    if (!currentPriority || priority === 'visible') saasThumbnailFetchIds.set(id, priority)
+  }
+  scheduleSaasThumbnailFetchTick()
+}
+
+function scheduleSaasThumbnailFetchTick() {
+  if (saasThumbnailFetchScheduled || saasThumbnailFetchIds.size === 0) return
+  saasThumbnailFetchScheduled = true
+  scheduleIdleTask(() => {
+    saasThumbnailFetchScheduled = false
+    void processNextSaasThumbnailFetch()
+  }, 1_500)
+}
+
+async function processNextSaasThumbnailFetch() {
+  const available = MAX_SAAS_THUMBNAIL_FETCH_CONCURRENT - saasThumbnailFetchRunningIds.size
+  if (available <= 0) return
+
+  const ids = getOrderedSaasThumbnailFetchIds().slice(0, available)
+  for (const id of ids) {
+    saasThumbnailFetchIds.delete(id)
+    startSaasThumbnailFetch(id)
+  }
+
+  if (saasThumbnailFetchIds.size > 0) scheduleSaasThumbnailFetchTick()
+}
+
+function getOrderedSaasThumbnailFetchIds() {
+  const visible: string[] = []
+  const background: string[] = []
+  for (const [id, priority] of saasThumbnailFetchIds) {
+    if (priority === 'visible') visible.push(id)
+    else background.push(id)
+  }
+  return [...visible, ...background]
+}
+
+function startSaasThumbnailFetch(id: string) {
+  saasThumbnailFetchRunningIds.add(id)
+
+  void (async () => {
+    if (getCachedThumbnail(id)) return
+
+    const stored = await getStoredFreshImageThumbnail(id)
+    if (stored?.thumbnailDataUrl) {
+      const thumbnail = {
+        dataUrl: stored.thumbnailDataUrl,
+        width: stored.width,
+        height: stored.height,
+        thumbnailVersion: stored.thumbnailVersion,
+      }
+      cacheThumbnail(id, thumbnail)
+      notifyImageThumbnail(id, thumbnail)
+      return
+    }
+
+    await cacheGeneratedThumbnailFromSaas(id)
+  })().catch(() => {
+    // 缩略图下载失败不影响任务列表；卡片会继续显示占位图。
+  }).finally(() => {
+    saasThumbnailFetchRunningIds.delete(id)
+    scheduleSaasThumbnailFetchTick()
+  })
+}
+
 function scheduleThumbnailBackfill(ids: Iterable<string>, priority: 'visible' | 'background' = 'background') {
   for (const id of ids) {
     if (getCachedThumbnail(id) || thumbnailBackfillRunningIds.has(id)) continue
@@ -292,11 +364,7 @@ function scheduleThumbnailBackfillTick() {
     void processNextThumbnailBackfill()
   }
 
-  if ('requestIdleCallback' in window) {
-    window.requestIdleCallback(run, { timeout: 2_000 })
-  } else {
-    globalThis.setTimeout(run, 250)
-  }
+  scheduleIdleTask(run)
 }
 
 async function processNextThumbnailBackfill() {
@@ -1004,6 +1072,8 @@ export async function deleteImageIfUnreferenced(imageId: string) {
   thumbnailCache.delete(imageId)
   thumbnailBackfillIds.delete(imageId)
   thumbnailBackfillRunningIds.delete(imageId)
+  saasThumbnailFetchIds.delete(imageId)
+  saasThumbnailFetchRunningIds.delete(imageId)
   thumbnailSubscribers.delete(imageId)
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
@@ -1836,27 +1906,66 @@ function mergeSaasTaskLocalState(remoteTask: TaskRecord, localTask?: TaskRecord)
     : remoteTask
 }
 
-async function cacheSaasTaskOutputThumbnails(task: TaskRecord): Promise<void> {
-  if (task.status !== 'done') return
-  await Promise.all(task.outputImages.map((imageId) => cacheGeneratedThumbnailFromSaas(imageId).catch(() => undefined)))
+function shouldPreserveLocalSaasRunningTask(task: TaskRecord, remoteTaskIds: Set<string>, now = Date.now()) {
+  return task.status === 'running' &&
+    !remoteTaskIds.has(task.id) &&
+    now - task.createdAt < SAAS_LOCAL_PENDING_PRESERVE_MS
 }
 
-async function applySaasTaskList(remoteTasks: TaskRecord[], options: { preserveLocalRunning?: boolean } = { preserveLocalRunning: true }): Promise<TaskRecord[]> {
+function persistTasksBestEffort(tasks: TaskRecord[]): void {
+  void Promise.all(tasks.map((task) => putTask(task))).catch((error) => {
+    console.warn('Failed to persist SaaS tasks locally:', error)
+  })
+}
+
+function scheduleSaasTaskOutputThumbnails(tasks: Iterable<TaskRecord>, priority: 'visible' | 'background' = 'background') {
+  const imageIds: string[] = []
+  for (const task of tasks) {
+    if (task.status !== 'done') continue
+    const coverImageId = task.outputImages?.[0]
+    if (coverImageId) imageIds.push(coverImageId)
+  }
+  scheduleSaasThumbnailFetch(imageIds, priority)
+}
+
+async function applySaasTaskList(
+  remoteTasks: TaskRecord[],
+  options: { preserveLocalRunning?: boolean; removeMissing?: boolean } = { preserveLocalRunning: true, removeMissing: true },
+): Promise<TaskRecord[]> {
   const currentTasks = useStore.getState().tasks
   const localTasksById = new Map(currentTasks.map((task) => [task.id, task]))
   const remoteTaskIds = new Set(remoteTasks.map((task) => task.id))
   const mergedTasks = remoteTasks.map((task) => mergeSaasTaskLocalState(task, localTasksById.get(task.id)))
-  const localRunningTasks = options.preserveLocalRunning
-    ? currentTasks.filter((task) => task.status === 'running' && !remoteTaskIds.has(task.id))
+  const retainedTasks = options.removeMissing === false
+    ? currentTasks.filter((task) => !remoteTaskIds.has(task.id))
     : []
-  const tasks = [...mergedTasks, ...localRunningTasks]
-  await Promise.all(tasks.map((task) => putTask(task)))
-  await Promise.all(tasks.map(cacheSaasTaskOutputThumbnails))
+  const localRunningTasks = options.removeMissing !== false && options.preserveLocalRunning
+    ? currentTasks.filter((task) => shouldPreserveLocalSaasRunningTask(task, remoteTaskIds))
+    : []
+  const tasks = [...mergedTasks, ...retainedTasks, ...localRunningTasks]
   useStore.getState().setTasks(tasks)
+  persistTasksBestEffort(tasks)
+  scheduleSaasTaskOutputThumbnails(tasks)
   return tasks
 }
 
+function refreshSaasTasksFromServer(options: { force?: boolean } = {}): void {
+  if (!isSaasMode()) return
+  const now = Date.now()
+  if (!options.force && now - lastSaasFullTaskRefreshAt < SAAS_FULL_TASK_REFRESH_MIN_INTERVAL_MS) return
+  lastSaasFullTaskRefreshAt = now
+  void listSaasTasks()
+    .then((result) => applySaasTaskList(result.tasks, { preserveLocalRunning: true, removeMissing: true }))
+    .catch((error) => {
+      console.warn('Failed to refresh SaaS tasks:', error)
+    })
+}
+
 async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
+  if (event.type === 'task.deleted') {
+    await removeTasksLocally([event.taskId], { showToast: false })
+    return
+  }
   if (event.type !== 'task.updated') return
   const currentTasks = useStore.getState().tasks
   const existing = currentTasks.find((task) => task.id === event.task.id)
@@ -1868,7 +1977,7 @@ async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
     useStore.getState().setTasks([task, ...currentTasks])
     await putTask(task)
   }
-  await cacheSaasTaskOutputThumbnails(task)
+  scheduleSaasTaskOutputThumbnails([task], event.phase === 'done' ? 'visible' : 'background')
   if (event.phase === 'done' && !wasDone) {
     useStore.getState().showToast(`生成完成，共 ${task.outputImages.length} 张图片`, 'success')
     if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${task.outputImages.length} 张图片。`)
@@ -1883,14 +1992,20 @@ function startSaasTaskEvents(): void {
   try {
     const source = createSaasTaskEventSource(getSaasTaskEventCursor())
     saasTaskEventSource = source
+    saasTaskEventsConnectedOnce = false
     source.onmessage = (message) => {
       try {
         if (message.lastEventId) setSaasTaskEventCursor(message.lastEventId)
         const event = JSON.parse(message.data) as SaasTaskEvent
         if (event.type === 'task.snapshot' && Array.isArray(event.tasks)) {
-          void applySaasTaskList(event.tasks)
+          void applySaasTaskList(event.tasks, { preserveLocalRunning: true, removeMissing: false })
         } else if (event.type === 'task.updated' && event.task && event.phase) {
           void applySaasTaskEvent(event)
+        } else if (event.type === 'task.deleted' && event.taskId) {
+          void applySaasTaskEvent(event)
+        } else if (event.type === 'connected') {
+          refreshSaasTasksFromServer({ force: saasTaskEventsConnectedOnce })
+          saasTaskEventsConnectedOnce = true
         }
       } catch (error) {
         console.warn('Failed to parse SaaS task event:', error)
@@ -1899,6 +2014,7 @@ function startSaasTaskEvents(): void {
     source.onerror = () => {
       if (source.readyState === EventSource.CLOSED && saasTaskEventSource === source) {
         saasTaskEventSource = null
+        saasTaskEventsConnectedOnce = false
       }
     }
   } catch (error) {
@@ -2221,8 +2337,9 @@ export async function initStore() {
     try {
       const localTasksById = new Map(storedTasks.map((task) => [task.id, task]))
       const remoteTasks = (await listSaasTasks()).tasks.map((task) => mergeSaasTaskLocalState(task, localTasksById.get(task.id)))
-      await Promise.all(remoteTasks.map((task) => putTask(task)))
-      await Promise.all(remoteTasks.map(cacheSaasTaskOutputThumbnails))
+      lastSaasFullTaskRefreshAt = Date.now()
+      persistTasksBestEffort(remoteTasks)
+      scheduleSaasTaskOutputThumbnails(remoteTasks)
       storedTasks = remoteTasks
     } catch (error) {
       console.warn('Failed to load SaaS tasks:', error)
@@ -2890,6 +3007,11 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
     await deleteImage(imgId)
     imageCache.delete(imgId)
     thumbnailCache.delete(imgId)
+    thumbnailBackfillIds.delete(imgId)
+    thumbnailBackfillRunningIds.delete(imgId)
+    saasThumbnailFetchIds.delete(imgId)
+    saasThumbnailFetchRunningIds.delete(imgId)
+    thumbnailSubscribers.delete(imgId)
   }
 }
 
@@ -4375,6 +4497,7 @@ async function cacheGeneratedThumbnailFromSaas(imageId: string) {
     thumbnailDataUrl,
     thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
   })
+  notifyImageThumbnail(imageId, thumbnail)
 }
 
 async function executeSaasTask(taskId: string, task: TaskRecord) {
@@ -4719,92 +4842,98 @@ export async function editOutputs(task: TaskRecord) {
   showToast(`已添加 ${added} 张输出图到输入`, 'success')
 }
 
-/** 删除多条任务 */
-export async function removeMultipleTasks(taskIds: string[]) {
-  const { tasks, setTasks, inputImages, galleryInputDraft, showToast, clearSelection, selectedTaskIds } = useStore.getState()
-  
-  if (!taskIds.length) return
-
-  const toDelete = new Set(taskIds)
-  const deletedTasks = tasks.filter(t => toDelete.has(t.id))
-  const remaining = await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks, tasks.filter(t => !toDelete.has(t.id)))
-
-  // 收集所有被删除任务的关联图片
-  const deletedImageIds = new Set<string>()
-  for (const t of tasks) {
-    if (toDelete.has(t.id)) {
-      addTaskReferencedImageIds(deletedImageIds, t)
+async function deleteSaasTasksFromServer(taskIds: string[]): Promise<{
+  succeeded: string[]
+  failed: Array<{ id: string; error: unknown }>
+}> {
+  const succeeded: string[] = []
+  const failed: Array<{ id: string; error: unknown }> = []
+  let nextIndex = 0
+  const workers = Array.from({ length: Math.min(4, taskIds.length) }, async () => {
+    while (nextIndex < taskIds.length) {
+      const taskId = taskIds[nextIndex++]!
+      try {
+        await deleteSaasTask(taskId)
+        succeeded.push(taskId)
+      } catch (error) {
+        failed.push({ id: taskId, error })
+      }
     }
+  })
+  await Promise.all(workers)
+  return { succeeded, failed }
+}
+
+async function removeTasksLocally(taskIds: string[], options: { showToast?: false | string } = {}): Promise<number> {
+  const uniqueTaskIds = uniqueIds(taskIds)
+  if (!uniqueTaskIds.length) return 0
+
+  const { tasks, setTasks, selectedTaskIds } = useStore.getState()
+  const toDelete = new Set(uniqueTaskIds)
+  const deletedTasks = tasks.filter((task) => toDelete.has(task.id))
+  if (!deletedTasks.length) {
+    await Promise.all(uniqueTaskIds.map((id) => dbDeleteTask(id).catch(() => undefined)))
+    return 0
   }
+
+  const remaining = await scrubAgentOutputPayloadsForDeletedTasks(deletedTasks, tasks.filter((task) => !toDelete.has(task.id)))
+  const deletedImageIds = new Set<string>()
+  for (const task of deletedTasks) addTaskReferencedImageIds(deletedImageIds, task)
 
   setTasks(remaining)
-  for (const id of taskIds) {
-    await dbDeleteTask(id)
-  }
+  await Promise.all(uniqueTaskIds.map((id) => dbDeleteTask(id).catch(() => undefined)))
+  await deleteUnreferencedImageIds(deletedImageIds)
 
-  // 找出其他任务仍引用的图片
-  const stillUsed = new Set<string>()
-  for (const t of remaining) {
-    addTaskReferencedImageIds(stillUsed, t)
-  }
-  addAgentReferencedImageIds(stillUsed)
-  addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
-  for (const img of inputImages) stillUsed.add(img.id)
-
-  // 删除孤立图片
-  for (const imgId of deletedImageIds) {
-    if (!stillUsed.has(imgId)) {
-      await deleteImage(imgId)
-      imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
-    }
-  }
-
-  // 如果删除的任务在选中列表中，则移除
-  const newSelection = selectedTaskIds.filter(id => !toDelete.has(id))
+  const newSelection = selectedTaskIds.filter((id) => !toDelete.has(id))
   if (newSelection.length !== selectedTaskIds.length) {
     useStore.getState().setSelectedTaskIds(newSelection)
   }
 
-  showToast(`已删除 ${taskIds.length} 个任务`, 'success')
+  if (options.showToast) useStore.getState().showToast(options.showToast, 'success')
+  return deletedTasks.length
+}
+
+/** 删除多条任务 */
+export async function removeMultipleTasks(taskIds: string[]) {
+  const uniqueTaskIds = uniqueIds(taskIds)
+  if (!uniqueTaskIds.length) return
+
+  const { showToast } = useStore.getState()
+  if (isSaasMode()) {
+    const result = await deleteSaasTasksFromServer(uniqueTaskIds)
+    if (result.succeeded.length > 0) {
+      await removeTasksLocally(result.succeeded, { showToast: false })
+      showToast(`已删除 ${result.succeeded.length} 个任务`, 'success')
+    }
+    if (result.failed.length > 0) {
+      const firstError = result.failed[0]?.error
+      const message = firstError instanceof Error ? firstError.message : '请稍后重试'
+      showToast(result.succeeded.length > 0
+        ? `部分任务删除失败：${result.failed.length} 个未删除`
+        : `删除失败：${message}`,
+      'error')
+    }
+    return
+  }
+
+  await removeTasksLocally(uniqueTaskIds, { showToast: `已删除 ${uniqueTaskIds.length} 个任务` })
 }
 
 /** 删除单条任务 */
 export async function removeTask(task: TaskRecord) {
-  const { tasks, setTasks, inputImages, galleryInputDraft, showToast } = useStore.getState()
-
-  // 收集此任务关联的图片
-  const taskImageIds = new Set([
-    ...(task.inputImageIds || []),
-    ...(task.maskImageId ? [task.maskImageId] : []),
-    ...(task.outputImages || []),
-    ...(task.streamPartialImageIds || []),
-  ])
-
-  // 从列表移除
-  const remaining = await scrubAgentOutputPayloadsForDeletedTasks([task], tasks.filter((t) => t.id !== task.id))
-  setTasks(remaining)
-  await dbDeleteTask(task.id)
-
-  // 找出其他任务仍引用的图片
-  const stillUsed = new Set<string>()
-  for (const t of remaining) {
-    addTaskReferencedImageIds(stillUsed, t)
-  }
-  addAgentReferencedImageIds(stillUsed)
-  addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
-  for (const img of inputImages) stillUsed.add(img.id)
-
-  // 删除孤立图片
-  for (const imgId of taskImageIds) {
-    if (!stillUsed.has(imgId)) {
-      await deleteImage(imgId)
-      imageCache.delete(imgId)
-      thumbnailCache.delete(imgId)
+  const { showToast } = useStore.getState()
+  if (isSaasMode()) {
+    try {
+      await deleteSaasTask(task.id)
+      await removeTasksLocally([task.id], { showToast: false })
+      showToast('任务已删除', 'success')
+    } catch (error) {
+      showToast(`删除失败：${error instanceof Error ? error.message : String(error)}`, 'error')
     }
+    return
   }
 
-  showToast('任务已删除', 'success')
+  await removeTasksLocally([task.id], { showToast: '任务已删除' })
 }
 
 /** 清空数据选项 */
@@ -4824,6 +4953,10 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
     imageCache.clear()
     thumbnailCache.clear()
     thumbnailBackfillIds.clear()
+    thumbnailBackfillRunningIds.clear()
+    saasThumbnailFetchIds.clear()
+    saasThumbnailFetchRunningIds.clear()
+    thumbnailSubscribers.clear()
     setTasks([])
     useStore.setState({
       agentConversations: [],

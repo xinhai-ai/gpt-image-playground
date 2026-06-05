@@ -40,7 +40,7 @@ import { prisma } from './prisma.js'
 import { callProvider, type ProviderImageResult, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
 import { assertSafeOutboundUrl, normalizeOutboundHttpUrl } from './security.js'
-import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes } from './storage.js'
+import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, deleteImageObjects, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes } from './storage.js'
 
 const MAX_SERVER_UPLOAD_BYTES = config.image.maxUploadBytes
 const MAX_AGENT_IMAGE_REFERENCES = 32
@@ -76,8 +76,14 @@ type TaskConnectedEventPayload = {
   serverTime: number
 }
 
+type TaskDeletedEventPayload = {
+  type: 'task.deleted'
+  taskId: string
+  serverTime: number
+}
+
 type TaskEventPayload = TaskUpdateEventPayload
-type TaskEventClientPayload = TaskEventPayload | TaskSnapshotEventPayload | TaskConnectedEventPayload
+type TaskEventClientPayload = TaskEventPayload | TaskSnapshotEventPayload | TaskConnectedEventPayload | TaskDeletedEventPayload
 
 type TaskEventClient = {
   id: string
@@ -94,6 +100,7 @@ let taskWorkerClosed = false
 let taskRecoveryTimer: NodeJS.Timeout | null = null
 let activeBetterAuth: AppAuth | null = null
 let lastTaskEventPruneAt = 0
+const cancelledTaskIds = new Set<string>()
 
 type AuthContext = {
   user: User
@@ -929,6 +936,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function isPrismaRecordNotFoundError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025'
+}
+
 function isProviderBaseUrlInputError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('Provider Base URL')
 }
@@ -1093,6 +1104,17 @@ function parseTaskEventCursor(value: unknown): bigint | null {
   }
 }
 
+function markTaskCancelled(taskId: string): void {
+  cancelledTaskIds.add(taskId)
+  setTimeout(() => {
+    cancelledTaskIds.delete(taskId)
+  }, taskLeaseMs()).unref()
+}
+
+function isTaskCancelled(taskId: string): boolean {
+  return cancelledTaskIds.has(taskId)
+}
+
 function writeTaskEventToClients(tenantId: string, payload: TaskEventClientPayload, eventId?: string): void {
   const clients = taskEventClients.get(tenantId)
   if (!clients?.size) return
@@ -1139,6 +1161,76 @@ async function publishTaskEvent(tenantId: string, payload: TaskEventPayload): Pr
   }
   maybePruneOldTaskEvents()
   writeTaskEventToClients(tenantId, payload, eventId)
+}
+
+function publishTaskDeletedEvent(tenantId: string, taskId: string): void {
+  writeTaskEventToClients(tenantId, {
+    type: 'task.deleted',
+    taskId,
+    serverTime: Date.now(),
+  })
+}
+
+function removeQueuedTaskId(taskId: string): void {
+  let index = queuedTaskIds.indexOf(taskId)
+  while (index !== -1) {
+    queuedTaskIds.splice(index, 1)
+    index = queuedTaskIds.indexOf(taskId)
+  }
+}
+
+async function deleteTaskForTenant(tenantId: string, taskId: string): Promise<{
+  deleted: boolean
+  deletedImageIds: string[]
+}> {
+  const task = await loadTaskWithRelations(taskId, tenantId)
+  if (!task) return { deleted: false, deletedImageIds: [] }
+
+  markTaskCancelled(taskId)
+  removeQueuedTaskId(taskId)
+
+  const outputImagesById = new Map(task.images
+    .filter((image) => image.role === TaskImageRole.OUTPUT)
+    .map((image) => [image.imageAssetId, image.imageAsset]))
+  const outputImageIds = [...outputImagesById.keys()]
+
+  const deletedImageIds = await prisma.$transaction(async (tx) => {
+    await tx.task.delete({ where: { id: task.id } })
+    if (outputImageIds.length === 0) return []
+
+    const referencedImages = await tx.taskImage.findMany({
+      where: {
+        tenantId,
+        imageAssetId: { in: outputImageIds },
+      },
+      select: { imageAssetId: true },
+    })
+    const referencedImageIds = new Set(referencedImages.map((image) => image.imageAssetId))
+    const orphanImageIds = outputImageIds.filter((imageId) => !referencedImageIds.has(imageId))
+    if (orphanImageIds.length > 0) {
+      await tx.imageAsset.deleteMany({
+        where: {
+          tenantId,
+          id: { in: orphanImageIds },
+        },
+      })
+    }
+    return orphanImageIds
+  }).catch((error) => {
+    if (isPrismaRecordNotFoundError(error)) return []
+    throw error
+  })
+
+  const imagesToDelete = deletedImageIds
+    .map((imageId) => outputImagesById.get(imageId))
+    .filter((image): image is ImageAsset => Boolean(image))
+  await Promise.allSettled(imagesToDelete.map((image) => deleteImageObjects(image)))
+
+  publishTaskDeletedEvent(tenantId, taskId)
+  return {
+    deleted: true,
+    deletedImageIds,
+  }
 }
 
 async function publishTaskById(taskId: string, phase: TaskEventPhase): Promise<void> {
@@ -1319,18 +1411,24 @@ async function archiveProviderImageResult(input: {
       createdByUserId: input.task.createdByUserId,
     },
   })
-  await prisma.taskImage.create({
-    data: {
-      tenantId: input.task.tenantId,
-      taskId: input.task.id,
-      imageAssetId: image.id,
-      role: TaskImageRole.OUTPUT,
-      sortIndex: input.index,
-      providerImageUrl: input.result.providerImageUrl,
-      actualParams: input.result.actualParams ? input.result.actualParams as Prisma.InputJsonValue : undefined,
-      revisedPrompt: input.result.revisedPrompt,
-    },
-  })
+  try {
+    await prisma.taskImage.create({
+      data: {
+        tenantId: input.task.tenantId,
+        taskId: input.task.id,
+        imageAssetId: image.id,
+        role: TaskImageRole.OUTPUT,
+        sortIndex: input.index,
+        providerImageUrl: input.result.providerImageUrl,
+        actualParams: input.result.actualParams ? input.result.actualParams as Prisma.InputJsonValue : undefined,
+        revisedPrompt: input.result.revisedPrompt,
+      },
+    })
+  } catch (error) {
+    await prisma.imageAsset.delete({ where: { id: image.id } }).catch(() => undefined)
+    await deleteImageObjects(image).catch(() => undefined)
+    throw error
+  }
 
   try {
     if (input.result.dataUrl) {
@@ -1393,12 +1491,14 @@ async function markTaskError(taskId: string, error: unknown, rawResponsePayload?
 async function executeTaskInWorker(taskId: string): Promise<void> {
   const claimed = await claimTask(taskId)
   if (!claimed) return
+  if (isTaskCancelled(taskId)) return
 
   let task = await loadTaskWithRelations(taskId)
   if (!task) return
   await publishTaskById(taskId, 'started')
 
   try {
+    if (isTaskCancelled(taskId)) return
     const existingOutputs = task.images.filter((image) => image.role === TaskImageRole.OUTPUT)
     if (existingOutputs.length > 0 && existingOutputs.every((image) => image.imageAsset.status === ImageStatus.READY)) {
       const finished = await maybeFinishTask(task.id, task.tenantId)
@@ -1412,6 +1512,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
     await clearStaleOutputImages(task)
     task = await loadTaskWithRelations(taskId)
     if (!task) return
+    if (isTaskCancelled(taskId)) return
 
     const providerProfile = task.providerProfile
     if (!providerProfile) throw new Error('任务使用的 Provider 配置已不存在')
@@ -1435,6 +1536,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
       maskImage: maskImageWithUrl,
     })
 
+    if (isTaskCancelled(taskId)) return
     await prisma.task.update({
       where: { id: task.id },
       data: {
@@ -1443,9 +1545,11 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
         rawResponsePayload: providerResult.rawResponsePayload,
       },
     })
+    if (isTaskCancelled(taskId)) return
     await publishTaskById(taskId, 'archiving')
 
     for (let index = 0; index < providerResult.images.length; index++) {
+      if (isTaskCancelled(taskId)) return
       await archiveProviderImageResult({
         task,
         result: providerResult.images[index]!,
@@ -1453,6 +1557,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
       })
     }
 
+    if (isTaskCancelled(taskId)) return
     const finishedTask = await prisma.task.update({
       where: { id: task.id },
       data: {
@@ -1488,8 +1593,15 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
       task: serializeTask(finishedTask),
     })
   } catch (error) {
+    if (isTaskCancelled(taskId) || isPrismaRecordNotFoundError(error)) return
     const rawResponsePayload = (error as Error & { rawResponsePayload?: string }).rawResponsePayload
-    await markTaskError(taskId, error, rawResponsePayload)
+    try {
+      await markTaskError(taskId, error, rawResponsePayload)
+    } catch (markError) {
+      if (!isPrismaRecordNotFoundError(markError)) throw markError
+    }
+  } finally {
+    cancelledTaskIds.delete(taskId)
   }
 }
 
@@ -2866,6 +2978,31 @@ export async function buildApp() {
     })
     if (!task) return reply.status(404).send({ error: '任务不存在' })
     return { task: serializeTask(task) }
+  })
+
+  app.delete('/api/tasks/:taskId', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    const { taskId } = request.params as { taskId: string }
+    const result = await deleteTaskForTenant(auth.tenant.id, taskId)
+    if (result.deleted) {
+      await writeUsageLog({
+        request,
+        auth,
+        action: 'task.delete',
+        targetType: 'task',
+        targetId: taskId,
+        detail: {
+          deletedOutputImageCount: result.deletedImageIds.length,
+        },
+      })
+    }
+    return {
+      ok: true,
+      deletedTaskId: taskId,
+      deletedImageIds: result.deletedImageIds,
+      alreadyDeleted: !result.deleted,
+    }
   })
 
   app.post('/api/tasks', async (request, reply) => {
