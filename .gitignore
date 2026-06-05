@@ -3,3 +3,7 @@ dist/
 .pnpm-store/
 dev-proxy.config.json
 .wrangler/
+.claude/
+.agents/
+.codex/
+.github/
