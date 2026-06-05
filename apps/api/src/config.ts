@@ -61,6 +61,9 @@ export const config = {
     forcePathStyle: readBoolean('S3_FORCE_PATH_STYLE', true),
     uploadUrlTtlSeconds: readNumber('S3_UPLOAD_URL_TTL_SECONDS', 15 * 60),
     readUrlTtlSeconds: readNumber('S3_READ_URL_TTL_SECONDS', 10 * 60),
+    publicImageBaseUrl: readEnv('PUBLIC_IMAGE_BASE_URL'),
+    publicThumbnailReads: readBoolean('PUBLIC_THUMBNAIL_READS', false),
+    publicOriginalReads: readBoolean('PUBLIC_ORIGINAL_READS', false),
   },
   defaultProvider: {
     name: readEnv('DEFAULT_PROVIDER_NAME', 'OpenAI'),

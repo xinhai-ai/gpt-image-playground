@@ -16,6 +16,7 @@ import { assertSafeOutboundUrl } from './security.js'
 
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 82
+const PUBLIC_READ_URL_TTL_SECONDS = 365 * 24 * 60 * 60
 
 function createS3Client(endpoint: string): S3Client {
   return new S3Client({
@@ -93,7 +94,31 @@ export async function createUploadUrl(image: Pick<ImageAsset, 'bucket' | 'object
   }
 }
 
+function encodeObjectKey(objectKey: string): string {
+  return objectKey
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/')
+}
+
+function shouldUsePublicReadUrl(object: Pick<ImageAsset, 'bucket'> & { objectKey: string }): boolean {
+  if (!config.s3.publicImageBaseUrl || object.bucket !== config.s3.bucket) return false
+  if (object.objectKey.endsWith('/thumbnail.webp')) return config.s3.publicThumbnailReads
+  if (object.objectKey.endsWith('/original')) return config.s3.publicOriginalReads
+  return false
+}
+
+function createPublicReadUrl(objectKey: string): { readUrl: string; expiresAt: string } {
+  const base = config.s3.publicImageBaseUrl.replace(/\/+$/, '')
+  return {
+    readUrl: `${base}/${encodeObjectKey(objectKey)}`,
+    expiresAt: new Date(Date.now() + PUBLIC_READ_URL_TTL_SECONDS * 1000).toISOString(),
+  }
+}
+
 export async function createReadUrlForObject(object: Pick<ImageAsset, 'bucket'> & { objectKey: string }): Promise<{ readUrl: string; expiresAt: string }> {
+  if (shouldUsePublicReadUrl(object)) return createPublicReadUrl(object.objectKey)
+
   const readUrl = await getSignedUrl(
     publicClient,
     new GetObjectCommand({
