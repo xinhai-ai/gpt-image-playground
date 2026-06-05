@@ -126,6 +126,22 @@ const AGENT_STOPPED_MESSAGE = '已停止生成。'
 const AGENT_CONVERSATION_TITLE_MAX_LENGTH = 28
 const ERROR_TOAST_MAX_LENGTH = 80
 type ToastType = 'info' | 'success' | 'error'
+
+export type DownloadProgressPhase = 'preparing' | 'downloading' | 'compressing' | 'saving' | 'done'
+
+export interface DownloadProgressState {
+  id: string
+  title: string
+  phase: DownloadProgressPhase
+  current: number
+  total: number
+  successCount: number
+  failCount: number
+  percent: number
+  currentFileName?: string
+  loadedBytes?: number
+  totalBytes?: number
+}
 type AgentInputDraft = {
   prompt: string
   inputImages: InputImage[]
@@ -1041,6 +1057,8 @@ interface AppState {
   // Toast
   toast: { message: string; type: ToastType } | null
   showToast: (message: string, type?: ToastType) => void
+  downloadProgress: DownloadProgressState | null
+  setDownloadProgress: (progress: DownloadProgressState | null) => void
 
   // Confirm dialog
   confirmDialog: {
@@ -1817,6 +1835,8 @@ export const useStore = create<AppState>()(
           set((s) => (s.toast === toast ? { toast: null } : s))
         }, 3000)
       },
+      downloadProgress: null,
+      setDownloadProgress: (downloadProgress) => set({ downloadProgress }),
 
       // Confirm
       confirmDialog: null,

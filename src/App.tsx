@@ -15,6 +15,7 @@ import Lightbox from './components/Lightbox'
 import SettingsModal from './components/SettingsModal'
 import ConfirmDialog from './components/ConfirmDialog'
 import Toast from './components/Toast'
+import DownloadProgress from './components/DownloadProgress'
 import MaskEditorModal from './components/MaskEditorModal'
 import ImageContextMenu from './components/ImageContextMenu'
 import SupportPromptModal from './components/SupportPromptModal'
@@ -127,6 +128,7 @@ export default function App() {
         </>
       )}
       <ConfirmDialog />
+      <DownloadProgress />
       <Toast />
     </>
   )
