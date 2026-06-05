@@ -49,6 +49,19 @@ export interface SaasTaskOutputImage {
   uploadExpiresAt?: string
 }
 
+export interface SaasImageUploadResponse {
+  imageId: string
+  objectKey?: string
+  contentType?: string
+  byteSize?: number
+  sha256?: string | null
+  sourceSha256?: string | null
+  width?: number | null
+  height?: number | null
+  status?: string
+  duplicate?: boolean
+}
+
 export interface SaasCreateTaskResponse {
   task: TaskRecord
   images: SaasTaskOutputImage[]
@@ -310,14 +323,49 @@ async function blobToDataUrl(blob: Blob): Promise<string> {
   })
 }
 
+function isSha256Hex(value: string | undefined | null): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)
+}
+
+async function hashBlobSha256(blob: Blob): Promise<string | undefined> {
+  if (!globalThis.crypto?.subtle) return undefined
+  const hashBuffer = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function getBlobSourceSha256(blob: Blob, provided?: string): Promise<string | undefined> {
+  if (isSha256Hex(provided)) return provided.toLowerCase()
+  return hashBlobSha256(blob)
+}
+
+async function findDuplicateSaasImage(blob: Blob, purpose: SaasImagePurpose, sourceSha256?: string): Promise<SaasImageUploadResponse | null> {
+  if (!sourceSha256) return null
+  const result = await saasRequest<{
+    duplicate: boolean
+    image: SaasImageUploadResponse | null
+  }>('/storage/images/deduplicate', {
+    method: 'POST',
+    body: JSON.stringify({
+      purpose,
+      sourceSha256,
+      contentType: blob.type || 'image/png',
+      byteSize: blob.size,
+    }),
+  })
+  return result.duplicate && result.image ? result.image : null
+}
+
 export async function uploadImageBlobToSaas(blob: Blob, purpose: SaasImagePurpose, metadata: { sha256?: string; width?: number; height?: number } = {}): Promise<string> {
-  void metadata
+  const sourceSha256 = await getBlobSourceSha256(blob, metadata.sha256)
+  const duplicate = await findDuplicateSaasImage(blob, purpose, sourceSha256)
+  if (duplicate) return duplicate.imageId
   const formData = new FormData()
   formData.append('purpose', purpose)
+  if (sourceSha256) formData.append('sourceSha256', sourceSha256)
   formData.append('file', blob, imageFileName(blob))
-  const uploaded = await saasRequest<{
-    imageId: string
-  }>('/storage/images', {
+  const uploaded = await saasRequest<SaasImageUploadResponse>('/storage/images', {
     method: 'POST',
     body: formData,
   })
@@ -341,9 +389,30 @@ export function uploadImageBlobToSaasWithProgress(
   const { onProgress, signal } = options
   if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
 
+  return (async () => {
+    const sourceSha256 = await getBlobSourceSha256(blob)
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    const duplicate = await findDuplicateSaasImage(blob, purpose, sourceSha256)
+    if (duplicate) {
+      onProgress?.(1)
+      return duplicate.imageId
+    }
+    return uploadImageBlobToSaasWithProgressRequest(blob, purpose, { ...options, sourceSha256 })
+  })()
+}
+
+function uploadImageBlobToSaasWithProgressRequest(
+  blob: Blob,
+  purpose: SaasImagePurpose,
+  options: UploadProgressOptions & { sourceSha256?: string } = {},
+): Promise<string> {
+  const { onProgress, signal, sourceSha256 } = options
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'))
+
   return new Promise<string>((resolve, reject) => {
     const formData = new FormData()
     formData.append('purpose', purpose)
+    if (sourceSha256) formData.append('sourceSha256', sourceSha256)
     formData.append('file', blob, imageFileName(blob))
 
     const xhr = new XMLHttpRequest()

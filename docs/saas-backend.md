@@ -28,6 +28,7 @@ GET  /api/tenants/current/members
 GET    /api/provider-profiles
 
 POST /api/storage/images
+POST /api/storage/images/deduplicate
 POST /api/storage/images/:imageId/upload
 POST /api/storage/upload-url
 POST /api/storage/images/:imageId/complete
@@ -96,12 +97,13 @@ Provider profiles are platform-global (`tenantId = null`) and shared by all tena
 - Provider API keys never leave the backend response surface. User-facing provider profile responses include only metadata such as `hasApiKey`; channel create/update/delete routes are platform-admin only.
 - Provider base URLs and provider-returned server-copy URLs are checked for SSRF risk. By default, localhost, private network, link-local, and metadata-style destinations are blocked. Set `ALLOW_PRIVATE_PROVIDER_URLS=true` only for trusted single-tenant/private deployments that need local model endpoints.
 - API-side image preprocessing limits upload bytes with `IMAGE_MAX_UPLOAD_BYTES` and decoded image pixels with `IMAGE_MAX_PIXELS`.
+- User uploads are deduplicated by tenant, purpose, and client-side `sourceSha256`. The browser hashes the file before upload and calls `/api/storage/images/deduplicate`; on a hit it reuses the existing `imageId` and skips upload, S3 writes, and thumbnail generation. The multipart upload endpoint recomputes the same source hash as a fallback for older clients.
 - Compatibility signed-upload completion re-reads the S3 object and runs backend preprocessing before marking an image ready. Task creation only accepts `READY` input and mask images.
 - API responses include basic hardening headers such as `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, and a restrictive `Permissions-Policy`.
 
 ## Image Flow
 
-Input images are uploaded by the browser to the API as multipart form data. The API validates and preprocesses the image, writes the original image object to S3-compatible storage, generates the cached WebP thumbnail, and stores tenant-scoped metadata.
+Input images are uploaded by the browser to the API as multipart form data. Before upload, the frontend computes a SHA-256 hash of the user-provided bytes and asks the API whether the tenant already has a ready image with the same `sourceSha256` and purpose. Duplicate uploads reuse the existing `imageId`. New uploads are validated and preprocessed by the API, written as original image objects to S3-compatible storage, cached as WebP thumbnails, and stored as tenant-scoped metadata.
 
 The original image object is stored at:
 

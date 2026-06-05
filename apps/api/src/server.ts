@@ -19,7 +19,7 @@ import {
   type TenantMember,
   type User,
 } from '@prisma/client'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import path from 'node:path'
@@ -130,17 +130,28 @@ const changePasswordSchema = z.object({
   logoutOtherSessions: z.boolean().optional(),
 })
 
+const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/i).transform((value) => value.toLowerCase())
+
 const uploadUrlSchema = z.object({
   contentType: z.string().min(1),
   byteSize: z.number().int().min(0).max(1024 * 1024 * 1024),
   purpose: z.enum(['input', 'mask', 'generated', 'thumbnail']),
   sha256: z.string().min(32).max(128).optional(),
+  sourceSha256: sha256HexSchema.optional(),
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
 })
 
 const uploadImageFormSchema = z.object({
   purpose: z.enum(['input', 'mask', 'generated', 'thumbnail']).default('input'),
+  sourceSha256: sha256HexSchema.optional(),
+})
+
+const imageDeduplicateSchema = z.object({
+  purpose: z.enum(['input', 'mask', 'generated', 'thumbnail']).default('input'),
+  sourceSha256: sha256HexSchema,
+  contentType: z.string().min(1).optional(),
+  byteSize: z.number().int().min(0).max(1024 * 1024 * 1024).optional(),
 })
 
 const createTaskSchema = z.object({
@@ -724,10 +735,32 @@ function imageUploadResponse(image: ImageAsset) {
     contentType: image.contentType,
     byteSize: image.byteSize,
     sha256: image.sha256,
+    sourceSha256: image.sourceSha256,
     width: image.width,
     height: image.height,
     status: image.status,
   }
+}
+
+function sourceSha256ForUpload(bytes: Uint8Array, provided?: string | null): string {
+  return provided?.trim().toLowerCase() || createHash('sha256').update(bytes).digest('hex')
+}
+
+async function findDuplicateImageAsset(
+  tenantId: string,
+  purpose: ImagePurpose,
+  sourceSha256?: string | null,
+): Promise<ImageAsset | null> {
+  if (!sourceSha256) return null
+  return prisma.imageAsset.findFirst({
+    where: {
+      tenantId,
+      purpose,
+      sourceSha256,
+      status: ImageStatus.READY,
+    },
+    orderBy: { createdAt: 'asc' },
+  })
 }
 
 async function processUploadIntoImage(
@@ -735,6 +768,7 @@ async function processUploadIntoImage(
   bytes: Uint8Array,
   contentType: string,
   purpose: ImagePurpose,
+  sourceSha256?: string | null,
 ): Promise<ImageAsset> {
   try {
     const processed = await processAndUploadImage(image, bytes, contentType, purpose)
@@ -745,6 +779,7 @@ async function processUploadIntoImage(
         contentType: processed.contentType,
         byteSize: processed.byteSize,
         sha256: processed.sha256,
+        sourceSha256,
         width: processed.width,
         height: processed.height,
         error: null,
@@ -2328,6 +2363,22 @@ export async function buildApp() {
       const upload = await readImageUploadBody(request)
       const body = parseBody(uploadImageFormSchema, upload.fields)
       const purpose = imagePurposeFromClient(body.purpose)
+      const sourceSha256 = sourceSha256ForUpload(upload.bytes, body.sourceSha256)
+      const duplicate = await findDuplicateImageAsset(auth.tenant.id, purpose, sourceSha256)
+      if (duplicate) {
+        await writeUsageLog({
+          request,
+          auth,
+          action: 'image.deduplicate',
+          targetType: 'image',
+          targetId: duplicate.id,
+          detail: {
+            purpose: duplicate.purpose,
+            sourceSha256,
+          },
+        })
+        return reply.status(200).send({ ...imageUploadResponse(duplicate), duplicate: true })
+      }
       const imageId = randomUUID()
       const image = await prisma.imageAsset.create({
         data: {
@@ -2340,9 +2391,10 @@ export async function buildApp() {
           purpose,
           status: ImageStatus.PENDING,
           createdByUserId: auth.user.id,
+          sourceSha256,
         },
       })
-      const processed = await processUploadIntoImage(image, upload.bytes, upload.contentType, purpose)
+      const processed = await processUploadIntoImage(image, upload.bytes, upload.contentType, purpose, sourceSha256)
       await writeUsageLog({
         request,
         auth,
@@ -2356,6 +2408,45 @@ export async function buildApp() {
         },
       })
       return reply.status(201).send(imageUploadResponse(processed))
+    } catch (error) {
+      if (error instanceof z.ZodError) return sendZodError(reply, error)
+      return reply.status(400).send({ error: errorMessage(error) })
+    }
+  })
+
+  app.post('/api/storage/images/deduplicate', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    if (!await enforceRateLimit(request, reply, {
+      bucket: 'storage.deduplicate',
+      keyParts: [auth.user.id],
+      max: 240,
+      windowMs: 10 * 60_000,
+    })) return
+    try {
+      const body = parseBody(imageDeduplicateSchema, request.body)
+      if (body.contentType && !isImageContentType(body.contentType)) {
+        return reply.status(400).send({ error: 'contentType 必须是 image/*' })
+      }
+      const purpose = imagePurposeFromClient(body.purpose)
+      const duplicate = await findDuplicateImageAsset(auth.tenant.id, purpose, body.sourceSha256)
+      if (!duplicate) return { duplicate: false, image: null }
+      await writeUsageLog({
+        request,
+        auth,
+        action: 'image.deduplicate_preflight',
+        targetType: 'image',
+        targetId: duplicate.id,
+        detail: {
+          purpose: duplicate.purpose,
+          sourceSha256: body.sourceSha256,
+          byteSize: body.byteSize,
+        },
+      })
+      return {
+        duplicate: true,
+        image: imageUploadResponse(duplicate),
+      }
     } catch (error) {
       if (error instanceof z.ZodError) return sendZodError(reply, error)
       return reply.status(400).send({ error: errorMessage(error) })
@@ -2377,6 +2468,29 @@ export async function buildApp() {
         return reply.status(400).send({ error: 'contentType 必须是 image/*' })
       }
       const purpose = imagePurposeFromClient(body.purpose)
+      const sourceSha256 = body.sourceSha256 ?? (/^[a-f0-9]{64}$/i.test(body.sha256 ?? '') ? body.sha256!.toLowerCase() : null)
+      const duplicate = await findDuplicateImageAsset(auth.tenant.id, purpose, sourceSha256)
+      if (duplicate) {
+        await writeUsageLog({
+          request,
+          auth,
+          action: 'image.deduplicate_upload_url',
+          targetType: 'image',
+          targetId: duplicate.id,
+          detail: {
+            purpose: duplicate.purpose,
+            sourceSha256,
+          },
+        })
+        return {
+          ...imageUploadResponse(duplicate),
+          duplicate: true,
+          uploadUrl: null,
+          expiresAt: null,
+          method: null,
+          headers: {},
+        }
+      }
       const imageId = randomUUID()
       const image = await prisma.imageAsset.create({
         data: {
@@ -2386,7 +2500,7 @@ export async function buildApp() {
           objectKey: objectKeyForImage(auth.tenant.id, imageId, purpose),
           contentType: body.contentType,
           byteSize: body.byteSize,
-          sha256: body.sha256,
+          sourceSha256,
           width: body.width,
           height: body.height,
           purpose,
@@ -2427,7 +2541,8 @@ export async function buildApp() {
       })
       if (!existing) return reply.status(404).send({ error: '图片不存在' })
       const upload = await readImageUploadBody(request)
-      const image = await processUploadIntoImage(existing, upload.bytes, upload.contentType, existing.purpose)
+      const sourceSha256 = sourceSha256ForUpload(upload.bytes, existing.sourceSha256)
+      const image = await processUploadIntoImage(existing, upload.bytes, upload.contentType, existing.purpose, sourceSha256)
       await writeUsageLog({
         request,
         auth,
@@ -2466,7 +2581,8 @@ export async function buildApp() {
       })
       if (!existing) return reply.status(404).send({ error: '图片不存在' })
       const uploaded = await readObjectBytes(existing.bucket, existing.objectKey)
-      const image = await processUploadIntoImage(existing, uploaded, existing.contentType, existing.purpose)
+      const sourceSha256 = sourceSha256ForUpload(uploaded, existing.sourceSha256)
+      const image = await processUploadIntoImage(existing, uploaded, existing.contentType, existing.purpose, sourceSha256)
       await writeUsageLog({
         request,
         auth,

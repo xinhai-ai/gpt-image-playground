@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { createHash } from 'node:crypto'
 import { buildApp } from '../src/server.js'
 import { prisma } from '../src/prisma.js'
 import { ensureBucket, ensureThumbnailForImage, readObjectBytes } from '../src/storage.js'
@@ -18,9 +19,10 @@ function cookieHeader(response: { headers: Record<string, string | string[] | un
   return raw.split(';')[0]!
 }
 
-function multipartImageBody(boundary: string, purpose = 'input'): Buffer {
+function multipartImageBody(boundary: string, purpose = 'input', sourceSha256?: string): Buffer {
   return Buffer.concat([
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\n${purpose}\r\n`),
+    ...(sourceSha256 ? [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="sourceSha256"\r\n\r\n${sourceSha256}\r\n`)] : []),
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="tiny.png"\r\nContent-Type: image/png\r\n\r\n`),
     TINY_PNG,
     Buffer.from(`\r\n--${boundary}--\r\n`),
@@ -107,5 +109,58 @@ describeWithDb('storage upload routes', () => {
     expect(thumbnail.byteSize).toBeGreaterThan(0)
     const thumbnailBytes = await readObjectBytes(thumbnail.bucket, thumbnail.objectKey)
     expect(Buffer.from(thumbnailBytes.subarray(0, 4)).toString('ascii')).toBe('RIFF')
+  })
+
+  it('deduplicates user uploads by client-side source hash before processing', async () => {
+    const cookie = await register(app)
+    const sourceSha256 = createHash('sha256').update(TINY_PNG).digest('hex')
+    const boundary = `test-dedupe-${Date.now()}`
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: '/api/storage/images',
+      headers: {
+        cookie,
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+      },
+      payload: multipartImageBody(boundary, 'input', sourceSha256),
+    })
+    expect(uploaded.statusCode).toBe(201)
+    const uploadedPayload = uploaded.json() as { imageId: string; sourceSha256: string | null; duplicate?: boolean }
+    expect(uploadedPayload.sourceSha256).toBe(sourceSha256)
+    expect(uploadedPayload.duplicate).toBeUndefined()
+
+    const preflight = await app.inject({
+      method: 'POST',
+      url: '/api/storage/images/deduplicate',
+      headers: { cookie },
+      payload: {
+        purpose: 'input',
+        sourceSha256,
+        contentType: 'image/png',
+        byteSize: TINY_PNG.byteLength,
+      },
+    })
+    expect(preflight.statusCode).toBe(200)
+    const preflightPayload = preflight.json() as { duplicate: boolean; image: { imageId: string } | null }
+    expect(preflightPayload.duplicate).toBe(true)
+    expect(preflightPayload.image?.imageId).toBe(uploadedPayload.imageId)
+
+    const secondBoundary = `test-dedupe-second-${Date.now()}`
+    const duplicated = await app.inject({
+      method: 'POST',
+      url: '/api/storage/images',
+      headers: {
+        cookie,
+        'content-type': `multipart/form-data; boundary=${secondBoundary}`,
+      },
+      payload: multipartImageBody(secondBoundary, 'input', sourceSha256),
+    })
+    expect(duplicated.statusCode).toBe(200)
+    const duplicatedPayload = duplicated.json() as { imageId: string; duplicate?: boolean }
+    expect(duplicatedPayload.imageId).toBe(uploadedPayload.imageId)
+    expect(duplicatedPayload.duplicate).toBe(true)
+
+    const imageCount = await prisma.imageAsset.count()
+    expect(imageCount).toBe(1)
   })
 })

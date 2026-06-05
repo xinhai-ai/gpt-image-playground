@@ -175,6 +175,7 @@ model ImageAsset {
   contentType     String
   byteSize        Int
   sha256          String?
+  sourceSha256    String?
   width           Int?
   height          Int?
   purpose         ImagePurpose
@@ -190,6 +191,7 @@ model ImageAsset {
   @@unique([bucket, objectKey])
   @@index([tenantId])
   @@index([tenantId, status])
+  @@index([tenantId, purpose, sourceSha256, status])
 }
 
 model Task {
@@ -238,7 +240,7 @@ model TaskImage {
   task              Task          @relation(fields: [taskId], references: [id], onDelete: Cascade)
   imageAsset        ImageAsset    @relation(fields: [imageAssetId], references: [id], onDelete: Cascade)
 
-  @@unique([taskId, imageAssetId, role])
+  @@index([taskId, imageAssetId, role])
   @@index([tenantId])
   @@index([imageAssetId])
 }
