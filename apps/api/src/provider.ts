@@ -133,9 +133,12 @@ function singleImageInput(input: ProviderCallInput, requestIndex?: number): Prov
 
 interface ProviderRequestFailure {
   requestIndex: number
+  attempt: number
   message: string
   rawResponsePayload?: string
 }
+
+const CONCURRENT_SINGLE_IMAGE_MAX_ATTEMPTS = 2
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
@@ -151,9 +154,10 @@ function getErrorRawResponsePayload(error: unknown): string | undefined {
   return undefined
 }
 
-function serializeProviderRequestFailure(error: unknown, requestIndex: number): ProviderRequestFailure {
+function serializeProviderRequestFailure(error: unknown, requestIndex: number, attempt: number): ProviderRequestFailure {
   return {
     requestIndex,
+    attempt,
     message: getErrorMessage(error),
     rawResponsePayload: getErrorRawResponsePayload(error),
   }
@@ -191,16 +195,32 @@ async function callConcurrentSingleImageRequests(
   requestCount: number,
   callSingle: (input: ProviderCallInput) => Promise<ProviderCallResult>,
 ): Promise<ProviderCallResult> {
-  const requests = Array.from({ length: requestCount }, (_, index) => callSingle(singleImageInput(input, index)))
-  const settled = await Promise.allSettled(requests)
-  const failures = settled.flatMap((result, index) => result.status === 'rejected'
-    ? [serializeProviderRequestFailure(result.reason, index)]
-    : [])
-  const fulfilled = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+  const fulfilled: ProviderCallResult[] = []
+  const failures: ProviderRequestFailure[] = []
+  let firstRejectedReason: unknown
+  let requestIndexOffset = 0
+
+  for (let attempt = 1; attempt <= CONCURRENT_SINGLE_IMAGE_MAX_ATTEMPTS; attempt++) {
+    const imageCount = fulfilled.reduce((count, result) => count + result.images.length, 0)
+    const missingCount = requestCount - imageCount
+    if (missingCount <= 0) break
+
+    const requests = Array.from({ length: missingCount }, (_, index) =>
+      callSingle(singleImageInput(input, requestIndexOffset + index)),
+    )
+    const settled = await Promise.allSettled(requests)
+    const batchFailures = settled.flatMap((result, index) => result.status === 'rejected'
+      ? [serializeProviderRequestFailure(result.reason, requestIndexOffset + index, attempt)]
+      : [])
+    const batchFulfilled = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+    firstRejectedReason ??= settled.find((result): result is PromiseRejectedResult => result.status === 'rejected')?.reason
+    failures.push(...batchFailures)
+    fulfilled.push(...batchFulfilled)
+    requestIndexOffset += missingCount
+  }
 
   if (!fulfilled.length && failures.length) {
-    const firstRejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected')
-    const error = firstRejected?.reason instanceof Error ? firstRejected.reason : new Error(failures[0]!.message)
+    const error = firstRejectedReason instanceof Error ? firstRejectedReason : new Error(failures[0]!.message)
     ;(error as Error & { rawResponsePayload?: string }).rawResponsePayload = combineRawResponsePayloads([], failures)
     throw error
   }

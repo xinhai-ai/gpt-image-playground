@@ -8,6 +8,7 @@ import { ensureBucket, readObjectBytes } from '../src/storage.js'
 const describeWithDb = process.env.DATABASE_URL ? describe : describe.skip
 
 const TINY_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
+let registerCounter = 0
 
 const DEFAULT_TASK_PARAMS = {
   size: 'auto',
@@ -42,11 +43,12 @@ async function clearDb() {
 }
 
 async function register(app: FastifyInstance): Promise<string> {
+  registerCounter += 1
   const response = await app.inject({
     method: 'POST',
     url: '/api/auth/register',
     payload: {
-      email: 'async-owner@example.com',
+      email: `async-owner-${registerCounter}@example.com`,
       password: 'correct-password',
       tenantName: 'async',
     },
@@ -232,7 +234,7 @@ describeWithDb('async SaaS task execution', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  it('keeps successful images when one concurrent OpenAI-compatible request fails', async () => {
+  it('retries missing concurrent OpenAI-compatible images after a single request fails', async () => {
     const cookie = await register(app)
     const providerProfileId = await createProvider(app, cookie)
     let requestIndex = 0
@@ -277,8 +279,62 @@ describeWithDb('async SaaS task execution', () => {
 
     const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
     expect(doneTask.status).toBe('done')
+    expect(doneTask.outputImages).toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    const task = await prisma.task.findUniqueOrThrow({ where: { id: createdPayload.task.id } })
+    expect(task.error).toBeNull()
+    expect(task.actualParams).toMatchObject({ n: 2 })
+    expect(task.rawResponsePayload).toContain('HTTP 504')
+  })
+
+  it('keeps successful images when concurrent OpenAI-compatible retry still fails', async () => {
+    const cookie = await register(app)
+    const providerProfileId = await createProvider(app, cookie)
+    let requestIndex = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      expect(input.toString()).toBe('https://api.openai.com/v1/images/generations')
+      const body = JSON.parse(String(init?.body ?? '{}')) as { n?: number }
+      expect(body.n).toBeUndefined()
+      const currentIndex = requestIndex++
+      if (currentIndex > 0) {
+        return new Response(JSON.stringify({
+          error: { message: 'HTTP 504' },
+        }), {
+          status: 504,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({
+        data: [{
+          b64_json: TINY_PNG_BASE64,
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie },
+      payload: {
+        prompt: 'make two tiny images with repeated provider failures',
+        params: { ...DEFAULT_TASK_PARAMS, n: 2 },
+        inputImageIds: [],
+        maskImageId: null,
+        providerProfileId,
+      },
+    })
+    expect(created.statusCode).toBe(202)
+    const createdPayload = created.json() as { task: { id: string } }
+
+    const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
+    expect(doneTask.status).toBe('done')
     expect(doneTask.outputImages).toHaveLength(1)
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
 
     const task = await prisma.task.findUniqueOrThrow({ where: { id: createdPayload.task.id } })
     expect(task.error).toBeNull()
