@@ -12,6 +12,7 @@ import type {
   InputImage,
   MaskDraft,
   TaskRecord,
+  TaskProgressPhase,
   FavoriteCollection,
   ExportData,
   ResponsesApiResponse,
@@ -2190,15 +2191,59 @@ async function hydrateSaasClientPreferences(seedTasks: TaskRecord[]): Promise<Ta
   }
 }
 
+function getSaasTaskProgressMessage(phase: TaskProgressPhase): string {
+  switch (phase) {
+    case 'queued':
+      return '任务已提交，等待执行'
+    case 'started':
+      return '任务已开始执行'
+    case 'provider_created':
+      return '已连接模型，正在创建响应'
+    case 'provider_in_progress':
+      return '模型正在处理请求'
+    case 'image_generation_started':
+      return '图像生成任务已启动'
+    case 'image_generating':
+      return '模型正在生成图像'
+    case 'image_result_received':
+      return '已收到图像结果，准备保存'
+    case 'provider_completed':
+      return '模型响应完成，正在整理结果'
+    case 'archiving':
+      return '正在保存生成图片'
+    case 'done':
+      return '生成完成'
+    case 'error':
+      return '生成失败'
+    default:
+      return '正在生成图像'
+  }
+}
+
+function shouldPreserveLocalTaskProgress(remoteTask: TaskRecord, localTask?: TaskRecord): boolean {
+  return Boolean(
+    localTask?.progressPhase &&
+    remoteTask.status === 'running' &&
+    !remoteTask.progressPhase,
+  )
+}
+
 function mergeSaasTaskLocalState(remoteTask: TaskRecord, localTask?: TaskRecord): TaskRecord {
-  if (saasPreferencesHydrated) return applySaasTaskFavoriteState(remoteTask)
-  return localTask
+  const taskWithProgress = shouldPreserveLocalTaskProgress(remoteTask, localTask)
     ? {
         ...remoteTask,
+        progressPhase: localTask?.progressPhase,
+        progressMessage: localTask?.progressMessage,
+      }
+    : remoteTask
+  if (saasPreferencesHydrated) return applySaasTaskFavoriteState(taskWithProgress)
+  return localTask
+    ? {
+        ...taskWithProgress,
         isFavorite: localTask.isFavorite,
         favoriteCollectionIds: localTask.favoriteCollectionIds,
       }
-    : remoteTask
+    : taskWithProgress
 }
 
 function shouldPreserveLocalSaasRunningTask(task: TaskRecord, remoteTaskIds: Set<string>, now = Date.now()) {
@@ -2265,7 +2310,11 @@ async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
   const currentTasks = useStore.getState().tasks
   const existing = currentTasks.find((task) => task.id === event.task.id)
   const wasDone = existing?.status === 'done'
-  const task = mergeSaasTaskLocalState(event.task, existing)
+  const task = mergeSaasTaskLocalState({
+    ...event.task,
+    progressPhase: event.phase,
+    progressMessage: event.progress?.message ?? getSaasTaskProgressMessage(event.phase),
+  }, existing)
   if (existing) {
     updateTaskInStore(task.id, task)
   } else {
@@ -2948,6 +2997,8 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     maskImageId,
     outputImages: [],
     status: 'running',
+    progressPhase: 'queued',
+    progressMessage: getSaasTaskProgressMessage('queued'),
     error: null,
     createdAt: Date.now(),
     finishedAt: null,
@@ -4813,6 +4864,8 @@ async function executeSaasTask(taskId: string, task: TaskRecord) {
     updateTaskInStore(taskId, {
       ...result.task,
       status: result.task.status,
+      progressPhase: result.task.progressPhase ?? 'queued',
+      progressMessage: result.task.progressMessage ?? getSaasTaskProgressMessage('queued'),
       error: result.task.error ?? null,
       falRecoverable: false,
       customRecoverable: false,

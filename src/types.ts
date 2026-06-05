@@ -155,6 +155,18 @@ export interface MaskDraft {
 // ===== 任务记录 =====
 
 export type TaskStatus = 'running' | 'done' | 'error'
+export type TaskProgressPhase =
+  | 'queued'
+  | 'started'
+  | 'provider_created'
+  | 'provider_in_progress'
+  | 'image_generation_started'
+  | 'image_generating'
+  | 'image_result_received'
+  | 'provider_completed'
+  | 'archiving'
+  | 'done'
+  | 'error'
 
 export interface TaskRecord {
   id: string
@@ -199,6 +211,10 @@ export interface TaskRecord {
   /** 发生解析错误时的原始响应 JSON */
   rawResponsePayload?: string
   status: TaskStatus
+  /** 服务端异步任务的细分进度阶段，用于运行中提示 */
+  progressPhase?: TaskProgressPhase
+  /** 服务端异步任务的细分进度文案 */
+  progressMessage?: string
   error: string | null
   createdAt: number
   finishedAt: number | null

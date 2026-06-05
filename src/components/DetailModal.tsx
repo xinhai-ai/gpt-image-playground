@@ -63,6 +63,9 @@ export default function DetailModal() {
     () => tasks.find((t) => t.id === detailTaskId) ?? null,
     [tasks, detailTaskId],
   )
+  const runningProgressMessage = task?.status === 'running'
+    ? task.progressMessage || '正在生成图像'
+    : ''
   const streamPreviewItems = useMemo(() => {
     const slotEntries = streamPreviewSlots
       ? Object.entries(streamPreviewSlots)
@@ -627,10 +630,23 @@ export default function DetailModal() {
                 </>
               )}
               {task.status === 'running' && streamPreviewLen === 0 && (
-                <svg className="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
+                <div className="flex flex-col items-center gap-3 px-6 text-center">
+                  <svg className="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  <p className="max-w-xs text-sm text-gray-600 dark:text-gray-300">
+                    {runningProgressMessage}
+                  </p>
+                </div>
+              )}
+              {task.status === 'running' && streamPreviewLen > 0 && runningProgressMessage && (
+                <div
+                  className="absolute left-1/2 max-w-[calc(100%-2rem)] -translate-x-1/2 truncate rounded bg-black/50 px-3 py-1 text-xs text-white backdrop-blur-sm"
+                  style={{ bottom: streamPreviewLen > 1 ? '2.75rem' : '1rem' }}
+                >
+                  {runningProgressMessage}
+                </div>
               )}
             </>
           )}

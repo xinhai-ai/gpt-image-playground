@@ -37,7 +37,7 @@ import {
 import { config } from './config.js'
 import { decryptSecret, encryptSecret, hashPassword, normalizeEmail, verifyPassword } from './crypto.js'
 import { prisma } from './prisma.js'
-import { callProvider, type ProviderImageResult, type TaskParams } from './provider.js'
+import { callProvider, type ProviderImageResult, type ProviderProgressEvent, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
 import { assertSafeOutboundUrl, normalizeOutboundHttpUrl } from './security.js'
 import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, deleteImageObjects, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes } from './storage.js'
@@ -56,12 +56,20 @@ const AUTH_COOKIE_CLEAR_OPTIONS = {
   secure: config.cookieSecure,
 }
 
-type TaskEventPhase = 'queued' | 'started' | 'archiving' | 'done' | 'error'
+type ProviderTaskEventPhase = ProviderProgressEvent['phase']
+type TaskEventPhase = 'queued' | 'started' | ProviderTaskEventPhase | 'archiving' | 'done' | 'error'
+
+type TaskProgressPayload = {
+  message: string
+  providerEventType?: string
+  requestIndex?: number
+}
 
 type TaskUpdateEventPayload = {
   type: 'task.updated'
   phase: TaskEventPhase
   task: ReturnType<typeof serializeTask>
+  progress?: TaskProgressPayload
 }
 
 type TaskSnapshotEventPayload = {
@@ -1371,14 +1379,32 @@ async function deleteTaskForTenant(tenantId: string, taskId: string): Promise<{
   }
 }
 
-async function publishTaskById(taskId: string, phase: TaskEventPhase): Promise<void> {
+async function publishTaskById(taskId: string, phase: TaskEventPhase, progress?: TaskProgressPayload): Promise<void> {
   const task = await loadTaskWithRelations(taskId)
   if (!task) return
   await publishTaskEvent(task.tenantId, {
     type: 'task.updated',
     phase,
     task: serializeTask(task),
+    ...(progress ? { progress } : {}),
   })
+}
+
+function createProviderProgressPublisher(taskId: string): (progress: ProviderProgressEvent) => Promise<void> {
+  const lastPublishedByRequest = new Map<string, { phase: ProviderTaskEventPhase; at: number }>()
+  return async (progress) => {
+    if (isTaskCancelled(taskId)) return
+    const requestKey = progress.requestIndex == null ? 'single' : String(progress.requestIndex)
+    const now = Date.now()
+    const lastPublished = lastPublishedByRequest.get(requestKey)
+    if (lastPublished?.phase === progress.phase && now - lastPublished.at < 2_000) return
+    lastPublishedByRequest.set(requestKey, { phase: progress.phase, at: now })
+    await publishTaskById(taskId, progress.phase, {
+      message: progress.message,
+      providerEventType: progress.providerEventType,
+      requestIndex: progress.requestIndex,
+    })
+  }
 }
 
 async function latestTaskEventId(tenantId: string): Promise<bigint | null> {
@@ -1666,12 +1692,14 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
 
     const inputImagesWithUrls = await Promise.all(inputImages.map(imageForProvider))
     const maskImageWithUrl = maskImage ? await imageForProvider(maskImage) : null
+    const publishProviderProgress = createProviderProgressPublisher(taskId)
     const providerResult = await callProvider({
       profile: providerProfile,
       prompt: task.prompt,
       params: task.params as unknown as TaskParams,
       inputImages: inputImagesWithUrls,
       maskImage: maskImageWithUrl,
+      onProgress: publishProviderProgress,
     })
 
     if (isTaskCancelled(taskId)) return

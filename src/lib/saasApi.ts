@@ -1,4 +1,4 @@
-import type { ApiProfile, AppMode, AppSettings, FavoriteCollection, TaskParams, TaskRecord } from '../types'
+import type { ApiProfile, AppMode, AppSettings, FavoriteCollection, TaskParams, TaskProgressPhase, TaskRecord } from '../types'
 import { dataUrlToBlob } from './canvasImage'
 import { readRuntimeEnv } from './runtimeEnv'
 
@@ -537,8 +537,13 @@ export function getSaasTask(taskId: string): Promise<{ task: TaskRecord }> {
 
 export type SaasTaskEvent = {
   type: 'task.updated'
-  phase: 'queued' | 'started' | 'archiving' | 'done' | 'error'
+  phase: TaskProgressPhase
   task: TaskRecord
+  progress?: {
+    message: string
+    providerEventType?: string
+    requestIndex?: number
+  }
 } | {
   type: 'task.snapshot'
   tasks: TaskRecord[]

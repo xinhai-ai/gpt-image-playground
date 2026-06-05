@@ -17,6 +17,7 @@ export interface ProviderCallInput {
   params: TaskParams
   inputImages: ProviderImageInput[]
   maskImage?: ProviderImageInput | null
+  onProgress?: (event: ProviderProgressEvent) => void | Promise<void>
 }
 
 export type ProviderImageInput = ImageAsset & {
@@ -38,6 +39,21 @@ export interface ProviderCallResult {
   rawImageUrls?: string[]
   rawResponsePayload?: string
   actualParams?: Partial<TaskParams>
+}
+
+export type ProviderProgressPhase =
+  | 'provider_created'
+  | 'provider_in_progress'
+  | 'image_generation_started'
+  | 'image_generating'
+  | 'image_result_received'
+  | 'provider_completed'
+
+export interface ProviderProgressEvent {
+  phase: ProviderProgressPhase
+  providerEventType: string
+  message: string
+  requestIndex?: number
 }
 
 const MIME_MAP: Record<TaskParams['output_format'], string> = {
@@ -99,13 +115,19 @@ function requestedImageCount(params: TaskParams): number {
   return Math.max(1, Math.min(10, n))
 }
 
-function singleImageInput(input: ProviderCallInput): ProviderCallInput {
+function singleImageInput(input: ProviderCallInput, requestIndex?: number): ProviderCallInput {
   return {
     ...input,
     params: {
       ...input.params,
       n: 1,
     },
+    onProgress: input.onProgress
+      ? (event) => input.onProgress?.({
+          ...event,
+          requestIndex,
+        })
+      : undefined,
   }
 }
 
@@ -169,7 +191,7 @@ async function callConcurrentSingleImageRequests(
   requestCount: number,
   callSingle: (input: ProviderCallInput) => Promise<ProviderCallResult>,
 ): Promise<ProviderCallResult> {
-  const requests = Array.from({ length: requestCount }, () => callSingle(singleImageInput(input)))
+  const requests = Array.from({ length: requestCount }, (_, index) => callSingle(singleImageInput(input, index)))
   const settled = await Promise.allSettled(requests)
   const failures = settled.flatMap((result, index) => result.status === 'rejected'
     ? [serializeProviderRequestFailure(result.reason, index)]
@@ -230,17 +252,23 @@ function getStreamEventErrorMessage(event: Record<string, unknown>): string | nu
   return null
 }
 
-function parseServerSentEventBlock(block: string): string | null {
+function parseServerSentEventBlock(block: string): { data: string; eventName?: string } | null {
   const dataLines: string[] = []
+  let eventName: string | undefined
   for (const line of block.split(/\r?\n/)) {
     if (!line || line.startsWith(':')) continue
+    if (line.startsWith('event:')) {
+      const value = line.slice(6).trim()
+      if (value) eventName = value
+      continue
+    }
     if (!line.startsWith('data:')) continue
     dataLines.push(line.slice(5).replace(/^ /, ''))
   }
 
   const data = dataLines.join('\n').trim()
   if (!data || data === '[DONE]') return null
-  return data
+  return { data, eventName }
 }
 
 async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void | Promise<void>): Promise<void> {
@@ -251,16 +279,17 @@ async function readJsonServerSentEvents(response: Response, onEvent: (event: Rec
   let buffer = ''
 
   const processBlock = async (block: string) => {
-    const data = parseServerSentEventBlock(block)
-    if (!data) return
+    const parsed = parseServerSentEventBlock(block)
+    if (!parsed) return
 
     let event: unknown
     try {
-      event = JSON.parse(data)
+      event = JSON.parse(parsed.data)
     } catch {
       throw new Error('Provider 流式响应包含无法解析的 JSON 事件')
     }
     if (!isRecord(event)) return
+    if (parsed.eventName && typeof event.type !== 'string') event.type = parsed.eventName
 
     const errorMessage = getStreamEventErrorMessage(event)
     if (errorMessage) throw new Error(errorMessage)
@@ -523,12 +552,79 @@ function getResponsesStreamPayload(event: Record<string, unknown>): Record<strin
   return null
 }
 
-async function parseResponsesStreamResponse(response: Response, params: TaskParams): Promise<ProviderCallResult> {
+function getResponsesStreamProgress(event: Record<string, unknown>): ProviderProgressEvent | null {
+  const type = getStringValue(event, 'type')
+  if (!type) return null
+
+  if (type === 'response.created') {
+    return {
+      phase: 'provider_created',
+      providerEventType: type,
+      message: '已连接模型，正在创建响应',
+    }
+  }
+  if (type === 'response.in_progress') {
+    return {
+      phase: 'provider_in_progress',
+      providerEventType: type,
+      message: '模型正在处理请求',
+    }
+  }
+  if (type === 'response.output_item.added') {
+    const item = event.item
+    if (!isRecord(item) || item.type !== 'image_generation_call') return null
+    return {
+      phase: 'image_generation_started',
+      providerEventType: type,
+      message: '图像生成任务已启动',
+    }
+  }
+  if (type === 'response.image_generation_call.in_progress') {
+    return {
+      phase: 'image_generation_started',
+      providerEventType: type,
+      message: '图像生成任务已启动',
+    }
+  }
+  if (type === 'response.image_generation_call.generating') {
+    return {
+      phase: 'image_generating',
+      providerEventType: type,
+      message: '模型正在生成图像',
+    }
+  }
+  if (type === 'response.output_item.done') {
+    const item = event.item
+    if (!isRecord(item) || item.type !== 'image_generation_call') return null
+    return {
+      phase: 'image_result_received',
+      providerEventType: type,
+      message: '已收到图像结果，准备保存',
+    }
+  }
+  if (type === 'response.completed') {
+    return {
+      phase: 'provider_completed',
+      providerEventType: type,
+      message: '模型响应完成，正在整理结果',
+    }
+  }
+  return null
+}
+
+async function parseResponsesStreamResponse(
+  response: Response,
+  params: TaskParams,
+  onProgress?: ProviderCallInput['onProgress'],
+): Promise<ProviderCallResult> {
   let completedPayload: Record<string, unknown> | null = null
   const outputItems: unknown[] = []
 
-  await readJsonServerSentEvents(response, (event) => {
+  await readJsonServerSentEvents(response, async (event) => {
     const type = getStringValue(event, 'type')
+    const progress = getResponsesStreamProgress(event)
+    if (progress) await onProgress?.(progress)
+
     const payload = getResponsesStreamPayload(event)
     if (!payload) return
 
@@ -588,7 +684,7 @@ async function callOpenAIResponsesSingle(input: ProviderCallInput): Promise<Prov
       stream: true,
     }),
   }, getTimeoutSeconds(profile), async (response) => {
-    if (isEventStreamResponse(response)) return parseResponsesStreamResponse(response, params)
+    if (isEventStreamResponse(response)) return parseResponsesStreamResponse(response, params, input.onProgress)
     return parseResponsesPayload(await response.json(), params)
   })
   return result

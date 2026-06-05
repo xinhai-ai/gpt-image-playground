@@ -363,6 +363,9 @@ describeWithDb('async SaaS task execution', () => {
       expect(body.stream).toBe(true)
       expect(body.tools?.[0]?.type).toBe('image_generation')
       const streamBody = [
+        'event: response.created\ndata: {"id":"resp-test"}\n\n',
+        'event: response.in_progress\ndata: {"id":"resp-test"}\n\n',
+        'event: response.image_generation_call.generating\ndata: {}\n\n',
         `data: ${JSON.stringify({
           type: 'response.output_item.done',
           item: {
@@ -401,5 +404,11 @@ describeWithDb('async SaaS task execution', () => {
     expect(doneTask.status).toBe('done')
     expect(doneTask.outputImages).toHaveLength(2)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    vi.unstubAllGlobals()
+    const sseText = await readSseUntilSnapshot(app, cookie)
+    expect(sseText).toContain('"phase":"provider_created"')
+    expect(sseText).toContain('"phase":"image_generating"')
+    expect(sseText).toContain('模型正在生成图像')
   })
 })
