@@ -305,16 +305,25 @@ describeWithDb('async SaaS task execution', () => {
     const providerProfileId = await createProvider(app, cookie, { apiMode: 'responses' })
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       expect(input.toString()).toBe('https://api.openai.com/v1/responses')
-      const body = JSON.parse(String(init?.body ?? '{}')) as { tools?: Array<{ type?: string }> }
+      const body = JSON.parse(String(init?.body ?? '{}')) as { stream?: boolean; tools?: Array<{ type?: string }> }
+      expect(body.stream).toBe(true)
       expect(body.tools?.[0]?.type).toBe('image_generation')
-      return new Response(JSON.stringify({
-        output: [{
-          type: 'image_generation_call',
-          result: TINY_PNG_BASE64,
-        }],
-      }), {
+      const streamBody = [
+        `data: ${JSON.stringify({
+          type: 'response.output_item.done',
+          item: {
+            type: 'image_generation_call',
+            result: TINY_PNG_BASE64,
+          },
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: { id: 'resp-test', output: [] },
+        })}\n\n`,
+      ].join('')
+      return new Response(streamBody, {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/event-stream' },
       })
     })
     vi.stubGlobal('fetch', fetchMock)

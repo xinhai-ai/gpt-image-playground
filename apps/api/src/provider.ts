@@ -164,7 +164,93 @@ async function getApiErrorMessage(response: Response): Promise<string> {
   return `HTTP ${response.status}`
 }
 
-async function fetchJson(url: string, init: RequestInit, timeoutSeconds: number): Promise<unknown> {
+function getStringValue(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function getStreamEventErrorMessage(event: Record<string, unknown>): string | null {
+  const error = event.error
+  if (isRecord(error)) {
+    const message = getStringValue(error, 'message')
+    if (message) return message
+  }
+  if (typeof error === 'string' && error.trim()) return error
+
+  const type = getStringValue(event, 'type')
+  if (type?.endsWith('.failed')) {
+    return getStringValue(event, 'message') ?? '流式请求失败'
+  }
+  return null
+}
+
+function parseServerSentEventBlock(block: string): string | null {
+  const dataLines: string[] = []
+  for (const line of block.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue
+    if (!line.startsWith('data:')) continue
+    dataLines.push(line.slice(5).replace(/^ /, ''))
+  }
+
+  const data = dataLines.join('\n').trim()
+  if (!data || data === '[DONE]') return null
+  return data
+}
+
+async function readJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void | Promise<void>): Promise<void> {
+  if (!response.body) throw new Error('Provider 未返回可读取的流式响应')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const processBlock = async (block: string) => {
+    const data = parseServerSentEventBlock(block)
+    if (!data) return
+
+    let event: unknown
+    try {
+      event = JSON.parse(data)
+    } catch {
+      throw new Error('Provider 流式响应包含无法解析的 JSON 事件')
+    }
+    if (!isRecord(event)) return
+
+    const errorMessage = getStreamEventErrorMessage(event)
+    if (errorMessage) throw new Error(errorMessage)
+
+    await onEvent(event)
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let separatorIndex = buffer.search(/\r?\n\r?\n/)
+    while (separatorIndex >= 0) {
+      const block = buffer.slice(0, separatorIndex)
+      const separator = buffer.match(/\r?\n\r?\n/)?.[0] ?? '\n\n'
+      buffer = buffer.slice(separatorIndex + separator.length)
+      await processBlock(block)
+      separatorIndex = buffer.search(/\r?\n\r?\n/)
+    }
+  }
+
+  buffer += decoder.decode()
+  if (buffer.trim()) await processBlock(buffer)
+}
+
+function isEventStreamResponse(response: Response): boolean {
+  return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false
+}
+
+async function fetchProviderResponse<T>(
+  url: string,
+  init: RequestInit,
+  timeoutSeconds: number,
+  readResponse: (response: Response) => Promise<T>,
+): Promise<T> {
   await assertSafeOutboundUrl(url, 'Provider API URL')
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutSeconds * 1000)
@@ -175,10 +261,14 @@ async function fetchJson(url: string, init: RequestInit, timeoutSeconds: number)
       cache: 'no-store',
     })
     if (!response.ok) throw new Error(await getApiErrorMessage(response))
-    return response.json()
+    return await readResponse(response)
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function fetchJson(url: string, init: RequestInit, timeoutSeconds: number): Promise<unknown> {
+  return fetchProviderResponse(url, init, timeoutSeconds, (response) => response.json())
 }
 
 function getTimeoutSeconds(profile: ProviderProfile): number {
@@ -375,6 +465,51 @@ function parseResponsesPayload(payload: unknown, params: TaskParams): ProviderCa
   }
 }
 
+function getResponsesStreamPayload(event: Record<string, unknown>): Record<string, unknown> | null {
+  const response = event.response
+  if (isRecord(response)) return response
+
+  const item = event.item
+  if (isRecord(item) && item.type === 'image_generation_call') {
+    return { output: [item] }
+  }
+
+  return null
+}
+
+async function parseResponsesStreamResponse(response: Response, params: TaskParams): Promise<ProviderCallResult> {
+  let completedPayload: Record<string, unknown> | null = null
+  const outputItems: unknown[] = []
+
+  await readJsonServerSentEvents(response, (event) => {
+    const type = getStringValue(event, 'type')
+    const payload = getResponsesStreamPayload(event)
+    if (!payload) return
+
+    if (type === 'response.output_item.done' && Array.isArray(payload.output)) {
+      outputItems.push(...payload.output)
+      return
+    }
+
+    completedPayload = payload
+  })
+
+  const payload = completedPayload ?? (outputItems.length ? { output: outputItems } : null)
+  if (!payload) {
+    return {
+      images: [],
+      rawResponsePayload: '流式接口未返回最终图片数据',
+    }
+  }
+
+  const result = parseResponsesPayload(payload, params)
+  if (!result.images.length && outputItems.length) {
+    const fallback = parseResponsesPayload({ output: outputItems }, params)
+    if (fallback.images.length) return fallback
+  }
+  return result
+}
+
 async function callOpenAIResponsesSingle(input: ProviderCallInput): Promise<ProviderCallResult> {
   const { profile, params } = input
   const profileConfig = asConfig(profile)
@@ -393,7 +528,7 @@ async function callOpenAIResponsesSingle(input: ProviderCallInput): Promise<Prov
     imageTool.input_image_mask = { image_url: input.maskImage.dataUrl }
   }
 
-  const payload = await fetchJson(joinUrl(profile.baseUrl, 'responses'), {
+  const result = await fetchProviderResponse(joinUrl(profile.baseUrl, 'responses'), {
     method: 'POST',
     headers: {
       ...createAuthHeaders(profile),
@@ -404,9 +539,13 @@ async function callOpenAIResponsesSingle(input: ProviderCallInput): Promise<Prov
       input: createResponsesInput(input.prompt, input.inputImages),
       tools: [imageTool],
       tool_choice: 'required',
+      stream: true,
     }),
-  }, getTimeoutSeconds(profile))
-  return parseResponsesPayload(payload, params)
+  }, getTimeoutSeconds(profile), async (response) => {
+    if (isEventStreamResponse(response)) return parseResponsesStreamResponse(response, params)
+    return parseResponsesPayload(await response.json(), params)
+  })
+  return result
 }
 
 async function callOpenAIResponses(input: ProviderCallInput): Promise<ProviderCallResult> {

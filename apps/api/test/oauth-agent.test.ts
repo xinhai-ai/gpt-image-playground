@@ -163,9 +163,12 @@ describeWithDb('GitHub OAuth and Agent image references', () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       expect(input.toString()).toBe('https://api.openai.com/v1/responses')
       upstreamBody = JSON.parse(String(init?.body)) as Record<string, unknown>
-      return new Response(JSON.stringify({ id: 'resp-1', output: [] }), {
+      return new Response(`data: ${JSON.stringify({
+        type: 'response.completed',
+        response: { id: 'resp-1', output: [] },
+      })}\n\n`, {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/event-stream' },
       })
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -194,8 +197,9 @@ describeWithDb('GitHub OAuth and Agent image references', () => {
       },
     })
     expect(response.statusCode).toBe(200)
+    expect((response.json() as { id: string }).id).toBe('resp-1')
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(upstreamBody?.stream).toBeUndefined()
+    expect(upstreamBody?.stream).toBe(true)
     const serialized = JSON.stringify(upstreamBody)
     expect(serialized).not.toContain('image_id')
     expect(serialized).toContain('data:image/png;base64,')

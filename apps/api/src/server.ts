@@ -1016,6 +1016,117 @@ async function upstreamErrorMessage(response: Response): Promise<string> {
   return `HTTP ${response.status}`
 }
 
+function upstreamStringValue(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim() ? value : undefined
+}
+
+function upstreamStreamEventErrorMessage(event: Record<string, unknown>): string | null {
+  const error = event.error
+  if (isRecord(error)) {
+    const message = upstreamStringValue(error, 'message')
+    if (message) return message
+  }
+  if (typeof error === 'string' && error.trim()) return error
+
+  const type = upstreamStringValue(event, 'type')
+  if (type?.endsWith('.failed')) return upstreamStringValue(event, 'message') ?? '流式请求失败'
+  return null
+}
+
+function parseUpstreamServerSentEventBlock(block: string): string | null {
+  const dataLines: string[] = []
+  for (const line of block.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue
+    if (!line.startsWith('data:')) continue
+    dataLines.push(line.slice(5).replace(/^ /, ''))
+  }
+
+  const data = dataLines.join('\n').trim()
+  if (!data || data === '[DONE]') return null
+  return data
+}
+
+async function readUpstreamJsonServerSentEvents(response: Response, onEvent: (event: Record<string, unknown>) => void | Promise<void>): Promise<void> {
+  if (!response.body) throw new Error('上游未返回可读取的流式响应')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const processBlock = async (block: string) => {
+    const data = parseUpstreamServerSentEventBlock(block)
+    if (!data) return
+
+    let event: unknown
+    try {
+      event = JSON.parse(data)
+    } catch {
+      throw new Error('上游流式响应包含无法解析的 JSON 事件')
+    }
+    if (!isRecord(event)) return
+
+    const errorMessage = upstreamStreamEventErrorMessage(event)
+    if (errorMessage) throw new Error(errorMessage)
+
+    await onEvent(event)
+  }
+
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let separatorIndex = buffer.search(/\r?\n\r?\n/)
+    while (separatorIndex >= 0) {
+      const block = buffer.slice(0, separatorIndex)
+      const separator = buffer.match(/\r?\n\r?\n/)?.[0] ?? '\n\n'
+      buffer = buffer.slice(separatorIndex + separator.length)
+      await processBlock(block)
+      separatorIndex = buffer.search(/\r?\n\r?\n/)
+    }
+  }
+
+  buffer += decoder.decode()
+  if (buffer.trim()) await processBlock(buffer)
+}
+
+function isUpstreamEventStreamResponse(response: Response): boolean {
+  return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false
+}
+
+function getUpstreamResponsesStreamPayload(event: Record<string, unknown>): Record<string, unknown> | null {
+  const response = event.response
+  if (isRecord(response)) return response
+
+  const item = event.item
+  if (isRecord(item)) return { output: [item] }
+
+  return null
+}
+
+async function readUpstreamResponsesStreamPayload(response: Response): Promise<Record<string, unknown>> {
+  let completedPayload: Record<string, unknown> | null = null
+  const outputItems: unknown[] = []
+
+  await readUpstreamJsonServerSentEvents(response, (event) => {
+    const type = upstreamStringValue(event, 'type')
+    const payload = getUpstreamResponsesStreamPayload(event)
+    if (!payload) return
+
+    if (type === 'response.output_item.done' && Array.isArray(payload.output)) {
+      outputItems.push(...payload.output)
+      return
+    }
+
+    completedPayload = payload
+  })
+
+  if (completedPayload) return completedPayload
+  if (outputItems.length) return { output: outputItems }
+  throw new Error('上游流式响应未返回最终结果')
+}
+
 class AgentImageReferenceError extends Error {}
 
 async function readAgentImageReferenceDataUrl(
@@ -3318,8 +3429,7 @@ export async function buildApp() {
       const apiKey = decryptSecret(providerProfile.apiKeyEncrypted)
       if (!apiKey) return reply.status(400).send({ error: `服务端 Provider 配置「${providerProfile.name}」缺少 API Key` })
       const resolved = await resolveAgentBodyImageIds(auth, body.body)
-      const upstreamBody = { ...resolved.body }
-      delete upstreamBody.stream
+      const upstreamBody = { ...resolved.body, stream: true }
       const upstreamUrl = providerApiUrl(providerProfile, 'responses')
       await assertSafeOutboundUrl(upstreamUrl, 'Provider API URL')
       await writeUsageLog({
@@ -3347,6 +3457,9 @@ export async function buildApp() {
         return reply.status(response.status >= 500 ? 502 : response.status).send({
           error: await upstreamErrorMessage(response),
         })
+      }
+      if (isUpstreamEventStreamResponse(response)) {
+        return readUpstreamResponsesStreamPayload(response)
       }
       return response.json()
     } catch (error) {
