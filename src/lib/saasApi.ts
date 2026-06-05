@@ -623,9 +623,21 @@ export function serverCopySaasTaskImage(taskId: string, imageId: string): Promis
   })
 }
 
-export function getSaasImageReadUrl(imageId: string, variant: 'original' | 'thumbnail' = 'original'): Promise<{ readUrl: string; contentType?: string }> {
+export interface SaasImageReadUrl {
+  imageId?: string
+  variant?: 'original' | 'thumbnail'
+  readUrl: string
+  expiresAt?: string
+  contentType?: string
+  byteSize?: number
+  width?: number | null
+  height?: number | null
+  status?: string
+}
+
+export function getSaasImageReadUrl(imageId: string, variant: 'original' | 'thumbnail' = 'original'): Promise<SaasImageReadUrl> {
   const suffix = variant === 'thumbnail' ? '?variant=thumbnail' : ''
-  return saasRequest<{ readUrl: string; contentType?: string }>(`/storage/images/${encodeURIComponent(imageId)}/read-url${suffix}`)
+  return saasRequest<SaasImageReadUrl>(`/storage/images/${encodeURIComponent(imageId)}/read-url${suffix}`)
 }
 
 async function fetchSaasImageVariantDataUrl(imageId: string, variant: 'original' | 'thumbnail'): Promise<string | undefined> {

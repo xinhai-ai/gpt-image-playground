@@ -47,7 +47,7 @@ import {
   createSaasTask,
   deleteSaasTask,
   fetchSaasImageDataUrl,
-  fetchSaasImageThumbnailDataUrl,
+  getSaasImageReadUrl,
   getSaasClientPreferences,
   isSaasMode,
   listSaasTasks,
@@ -73,21 +73,30 @@ export const DEFAULT_FAVORITE_COLLECTION_ID = '__default_favorites__'
 export const DEFAULT_FAVORITE_COLLECTION_NAME = '默认'
 
 // ===== Image cache =====
-// 内存缓存，id → dataUrl。只保留少量最近使用图片，避免大量 4K data URL 常驻内存。
+// 内存缓存。原图只缓存 dataURL；缩略图可缓存本地 dataURL 或服务端 read URL。
+
+type CachedThumbnail = {
+  dataUrl: string
+  width?: number
+  height?: number
+  thumbnailVersion?: number
+  expiresAt?: number
+}
 
 const imageCache = new Map<string, string>()
-const thumbnailCache = new Map<string, { dataUrl: string; width?: number; height?: number; thumbnailVersion?: number }>()
+const thumbnailCache = new Map<string, CachedThumbnail>()
 const thumbnailBackfillIds = new Map<string, 'visible' | 'background'>()
 const thumbnailBackfillRunningIds = new Set<string>()
 const saasThumbnailFetchIds = new Map<string, 'visible' | 'background'>()
 const saasThumbnailFetchRunningIds = new Set<string>()
-const thumbnailSubscribers = new Map<string, Set<(thumbnail: { dataUrl: string; width?: number; height?: number }) => void>>()
+const thumbnailSubscribers = new Map<string, Set<(thumbnail: CachedThumbnail) => void>>()
 let thumbnailBackfillScheduled = false
 let saasThumbnailFetchScheduled = false
 const MAX_IMAGE_CACHE_ENTRIES = 8
 const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
 const MAX_SAAS_THUMBNAIL_FETCH_CONCURRENT = 4
+const THUMBNAIL_URL_EXPIRY_GRACE_MS = 30_000
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SAAS_TASK_EVENT_CURSOR_KEY = 'gpt-image-playground.saas-task-event-cursor'
@@ -188,7 +197,9 @@ function cacheImage(id: string, dataUrl: string) {
 
 function getCachedThumbnail(id: string) {
   const thumbnail = thumbnailCache.get(id)
-  if (thumbnail?.thumbnailVersion === CURRENT_THUMBNAIL_VERSION) {
+  const isFresh = thumbnail?.thumbnailVersion === CURRENT_THUMBNAIL_VERSION &&
+    (!thumbnail.expiresAt || thumbnail.expiresAt > Date.now() + THUMBNAIL_URL_EXPIRY_GRACE_MS)
+  if (thumbnail && isFresh) {
     thumbnailCache.delete(id)
     thumbnailCache.set(id, thumbnail)
     return thumbnail
@@ -199,7 +210,7 @@ function getCachedThumbnail(id: string) {
   return undefined
 }
 
-function cacheThumbnail(id: string, thumbnail: { dataUrl: string; width?: number; height?: number; thumbnailVersion?: number }) {
+function cacheThumbnail(id: string, thumbnail: CachedThumbnail) {
   if (thumbnail.thumbnailVersion !== CURRENT_THUMBNAIL_VERSION) return
   thumbnailCache.delete(id)
   thumbnailCache.set(id, thumbnail)
@@ -208,6 +219,10 @@ function cacheThumbnail(id: string, thumbnail: { dataUrl: string; width?: number
     if (oldestKey == null) break
     thumbnailCache.delete(oldestKey)
   }
+}
+
+function isDirectThumbnailUrl(thumbnail: CachedThumbnail | undefined) {
+  return Boolean(thumbnail?.dataUrl && !thumbnail.dataUrl.startsWith('data:'))
 }
 
 export async function ensureImageCached(id: string): Promise<string | undefined> {
@@ -237,16 +252,17 @@ export async function ensureImageCached(id: string): Promise<string | undefined>
   return undefined
 }
 
-export async function ensureImageThumbnailCached(id: string): Promise<{ dataUrl: string; width?: number; height?: number } | undefined> {
+export async function ensureImageThumbnailCached(id: string): Promise<CachedThumbnail | undefined> {
   const cached = getCachedThumbnail(id)
-  if (cached) return cached
+  if (cached && (!isSaasMode() || isDirectThumbnailUrl(cached))) return cached
+
+  if (isSaasMode()) {
+    scheduleSaasThumbnailFetch([id], 'visible')
+    return undefined
+  }
 
   const rec = await getStoredFreshImageThumbnail(id)
   if (!rec?.thumbnailDataUrl) {
-    if (isSaasMode()) {
-      scheduleSaasThumbnailFetch([id], 'visible')
-      return undefined
-    }
     scheduleThumbnailBackfill([id], 'visible')
     return undefined
   }
@@ -261,7 +277,7 @@ export async function ensureImageThumbnailCached(id: string): Promise<{ dataUrl:
   return thumbnail
 }
 
-export function subscribeImageThumbnail(id: string, callback: (thumbnail: { dataUrl: string; width?: number; height?: number }) => void) {
+export function subscribeImageThumbnail(id: string, callback: (thumbnail: CachedThumbnail) => void) {
   let subscribers = thumbnailSubscribers.get(id)
   if (!subscribers) {
     subscribers = new Set()
@@ -274,7 +290,7 @@ export function subscribeImageThumbnail(id: string, callback: (thumbnail: { data
   }
 }
 
-function notifyImageThumbnail(id: string, thumbnail: { dataUrl: string; width?: number; height?: number }) {
+function notifyImageThumbnail(id: string, thumbnail: CachedThumbnail) {
   thumbnailSubscribers.get(id)?.forEach((callback) => callback(thumbnail))
 }
 
@@ -332,7 +348,10 @@ function startSaasThumbnailFetch(id: string) {
   saasThumbnailFetchRunningIds.add(id)
 
   void (async () => {
-    if (getCachedThumbnail(id)) return
+    const cached = getCachedThumbnail(id)
+    if (isDirectThumbnailUrl(cached)) return
+
+    if (await cacheGeneratedThumbnailFromSaas(id)) return
 
     const stored = await getStoredFreshImageThumbnail(id)
     if (stored?.thumbnailDataUrl) {
@@ -346,8 +365,6 @@ function startSaasThumbnailFetch(id: string) {
       notifyImageThumbnail(id, thumbnail)
       return
     }
-
-    await cacheGeneratedThumbnailFromSaas(id)
   })().catch(() => {
     // 缩略图下载失败不影响任务列表；卡片会继续显示占位图。
   }).finally(() => {
@@ -4765,20 +4782,20 @@ async function executeTask(taskId: string) {
   }
 }
 
-async function cacheGeneratedThumbnailFromSaas(imageId: string) {
-  const thumbnailDataUrl = await fetchSaasImageThumbnailDataUrl(imageId).catch(() => undefined)
-  if (!thumbnailDataUrl) return
+async function cacheGeneratedThumbnailFromSaas(imageId: string): Promise<boolean> {
+  const signed = await getSaasImageReadUrl(imageId, 'thumbnail').catch(() => undefined)
+  if (!signed?.readUrl) return false
+  const expiresAt = signed.expiresAt ? Date.parse(signed.expiresAt) : undefined
   const thumbnail = {
-    dataUrl: thumbnailDataUrl,
+    dataUrl: signed.readUrl,
+    width: signed.width ?? undefined,
+    height: signed.height ?? undefined,
     thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+    expiresAt: expiresAt && Number.isFinite(expiresAt) ? expiresAt : undefined,
   }
   cacheThumbnail(imageId, thumbnail)
-  await putImageThumbnail({
-    id: imageId,
-    thumbnailDataUrl,
-    thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
-  })
   notifyImageThumbnail(imageId, thumbnail)
+  return true
 }
 
 async function executeSaasTask(taskId: string, task: TaskRecord) {

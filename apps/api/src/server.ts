@@ -2959,6 +2959,8 @@ export async function buildApp() {
         expiresAt: signed.expiresAt,
         contentType: thumbnail.contentType,
         byteSize: thumbnail.byteSize,
+        width: image.width,
+        height: image.height,
         status: image.status,
       }
     }
@@ -2970,6 +2972,8 @@ export async function buildApp() {
       expiresAt: signed.expiresAt,
       contentType: image.contentType,
       byteSize: image.byteSize,
+      width: image.width,
+      height: image.height,
       status: image.status,
     }
   })
