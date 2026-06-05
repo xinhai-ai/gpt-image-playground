@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useRef } from 'react'
 import { useCloseOnEscape } from '../../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../../hooks/usePreventBackgroundScroll'
 import { CloseIcon } from '../icons'
@@ -24,8 +24,9 @@ export interface ModalProps {
 }
 
 export function Modal({ open, onClose, title, icon, size = 'md', dismissible = true, footer, children }: ModalProps) {
+  const scrollRef = useRef<HTMLDivElement>(null)
   useCloseOnEscape(open && dismissible, onClose)
-  usePreventBackgroundScroll(open)
+  usePreventBackgroundScroll(open, scrollRef)
 
   if (!open) return null
 
@@ -57,7 +58,7 @@ export function Modal({ open, onClose, title, icon, size = 'md', dismissible = t
             )}
           </div>
         )}
-        <div className="custom-scrollbar flex-1 overflow-y-auto overscroll-contain p-5">{children}</div>
+        <div ref={scrollRef} className="custom-scrollbar min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain p-5 [-webkit-overflow-scrolling:touch]">{children}</div>
         {footer && <div className="shrink-0 border-t border-gray-100 px-5 py-4 dark:border-white/[0.08]">{footer}</div>}
       </div>
     </div>
