@@ -132,6 +132,7 @@ model Tenant {
   images          ImageAsset[]
   tasks           Task[]
   taskImages      TaskImage[]
+  taskEvents      TaskEvent[]
   usageLogs       UsageLog[]
 }
 
@@ -218,6 +219,7 @@ model Task {
   providerProfile   ProviderProfile? @relation(fields: [providerProfileId], references: [id], onDelete: SetNull)
   createdBy         User            @relation("TaskCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
   images            TaskImage[]
+  events            TaskEvent[]
 
   @@index([tenantId, createdAt])
   @@index([tenantId, status])
@@ -243,6 +245,22 @@ model TaskImage {
   @@index([taskId, imageAssetId, role])
   @@index([tenantId])
   @@index([imageAssetId])
+}
+
+model TaskEvent {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  String
+  taskId    String
+  type      String
+  phase     String
+  payload   Json
+  createdAt DateTime @default(now())
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, id])
+  @@index([taskId])
+  @@index([createdAt])
 }
 
 model UsageLog {

@@ -490,14 +490,24 @@ export function getSaasTask(taskId: string): Promise<{ task: TaskRecord }> {
   return saasRequest<{ task: TaskRecord }>(`/tasks/${encodeURIComponent(taskId)}`)
 }
 
-export interface SaasTaskEvent {
+export type SaasTaskEvent = {
   type: 'task.updated'
   phase: 'queued' | 'started' | 'archiving' | 'done' | 'error'
   task: TaskRecord
+} | {
+  type: 'task.snapshot'
+  tasks: TaskRecord[]
+  serverTime: number
+} | {
+  type: 'connected'
+  workerId: string
+  eventCursor: string | null
+  serverTime: number
 }
 
-export function createSaasTaskEventSource(): EventSource {
-  return new EventSource(buildUrl('/tasks/events'), { withCredentials: true })
+export function createSaasTaskEventSource(cursor?: string | null): EventSource {
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  return new EventSource(buildUrl(`/tasks/events${query}`), { withCredentials: true })
 }
 
 export function createSaasTask(input: {

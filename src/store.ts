@@ -81,6 +81,7 @@ const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
+const SAAS_TASK_EVENT_CURSOR_KEY = 'gpt-image-playground.saas-task-event-cursor'
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
@@ -88,8 +89,6 @@ const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let saasTaskEventSource: EventSource | null = null
-let saasTaskReconcileTimer: ReturnType<typeof setInterval> | null = null
-let saasTaskReconcileRunning = false
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -1771,6 +1770,16 @@ function putTask(task: TaskRecord): Promise<IDBValidKey> {
   return dbPutTask(getPersistableTask(task))
 }
 
+function getSaasTaskEventCursor(): string | null {
+  if (typeof localStorage === 'undefined') return null
+  return localStorage.getItem(SAAS_TASK_EVENT_CURSOR_KEY)
+}
+
+function setSaasTaskEventCursor(cursor: string): void {
+  if (typeof localStorage === 'undefined' || !cursor) return
+  localStorage.setItem(SAAS_TASK_EVENT_CURSOR_KEY, cursor)
+}
+
 export function getCodexCliPromptKey(settings: AppSettings): string {
   const profile = getActiveApiProfile(settings)
   return `${profile.baseUrl}\n${profile.apiKey}`
@@ -1848,8 +1857,10 @@ async function applySaasTaskList(remoteTasks: TaskRecord[], options: { preserveL
 }
 
 async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
+  if (event.type !== 'task.updated') return
   const currentTasks = useStore.getState().tasks
   const existing = currentTasks.find((task) => task.id === event.task.id)
+  const wasDone = existing?.status === 'done'
   const task = mergeSaasTaskLocalState(event.task, existing)
   if (existing) {
     updateTaskInStore(task.id, task)
@@ -1858,7 +1869,7 @@ async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
     await putTask(task)
   }
   await cacheSaasTaskOutputThumbnails(task)
-  if (event.phase === 'done') {
+  if (event.phase === 'done' && !wasDone) {
     useStore.getState().showToast(`生成完成，共 ${task.outputImages.length} 张图片`, 'success')
     if (!isAgentTask(task)) showTaskCompletionNotification('图像生成完成', `生成完成，共 ${task.outputImages.length} 张图片。`)
   }
@@ -1867,56 +1878,32 @@ async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
   }
 }
 
-async function reconcileSaasTasks(): Promise<void> {
-  if (!isSaasMode() || saasTaskReconcileRunning) return
-  saasTaskReconcileRunning = true
-  try {
-    await applySaasTaskList((await listSaasTasks()).tasks)
-  } catch (error) {
-    console.warn('Failed to reconcile SaaS tasks:', error)
-  } finally {
-    saasTaskReconcileRunning = false
-  }
-}
-
-function startSaasTaskReconcileLoop(): void {
-  if (!isSaasMode() || saasTaskReconcileTimer) return
-  saasTaskReconcileTimer = setInterval(() => {
-    void reconcileSaasTasks()
-  }, 30_000)
-  if (typeof window !== 'undefined') {
-    window.addEventListener('focus', () => void reconcileSaasTasks())
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) void reconcileSaasTasks()
-    })
-  }
-}
-
 function startSaasTaskEvents(): void {
   if (!isSaasMode() || saasTaskEventSource) return
   try {
-    const source = createSaasTaskEventSource()
+    const source = createSaasTaskEventSource(getSaasTaskEventCursor())
     saasTaskEventSource = source
-    source.onopen = () => {
-      void reconcileSaasTasks()
-    }
     source.onmessage = (message) => {
       try {
-        const event = JSON.parse(message.data) as Partial<SaasTaskEvent>
-        if (event.type === 'task.updated' && event.task && event.phase) {
-          void applySaasTaskEvent(event as SaasTaskEvent)
+        if (message.lastEventId) setSaasTaskEventCursor(message.lastEventId)
+        const event = JSON.parse(message.data) as SaasTaskEvent
+        if (event.type === 'task.snapshot' && Array.isArray(event.tasks)) {
+          void applySaasTaskList(event.tasks)
+        } else if (event.type === 'task.updated' && event.task && event.phase) {
+          void applySaasTaskEvent(event)
         }
       } catch (error) {
         console.warn('Failed to parse SaaS task event:', error)
       }
     }
     source.onerror = () => {
-      void reconcileSaasTasks()
+      if (source.readyState === EventSource.CLOSED && saasTaskEventSource === source) {
+        saasTaskEventSource = null
+      }
     }
   } catch (error) {
     console.warn('Failed to start SaaS task events:', error)
   }
-  startSaasTaskReconcileLoop()
 }
 
 function failOpenAITaskIfStillRunning(taskId: string, error: string, now = Date.now()) {
@@ -4410,7 +4397,6 @@ async function executeSaasTask(taskId: string, task: TaskRecord) {
       customRecoverable: false,
     })
     startSaasTaskEvents()
-    void reconcileSaasTasks()
   } catch (error) {
     if (error instanceof SaasApiError && error.task) {
       updateTaskInStore(taskId, {

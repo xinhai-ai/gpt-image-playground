@@ -44,6 +44,10 @@ import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, create
 
 const MAX_SERVER_UPLOAD_BYTES = config.image.maxUploadBytes
 const MAX_AGENT_IMAGE_REFERENCES = 32
+const TASK_EVENT_REPLAY_LIMIT = 500
+const TASK_EVENT_SNAPSHOT_TASK_LIMIT = 200
+const TASK_EVENT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
+const TASK_EVENT_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 const TASK_WORKER_ID = `api-${randomUUID()}`
 const AUTH_COOKIE_CLEAR_OPTIONS = {
   path: '/',
@@ -53,16 +57,32 @@ const AUTH_COOKIE_CLEAR_OPTIONS = {
 
 type TaskEventPhase = 'queued' | 'started' | 'archiving' | 'done' | 'error'
 
-type TaskEventPayload = {
+type TaskUpdateEventPayload = {
   type: 'task.updated'
   phase: TaskEventPhase
   task: ReturnType<typeof serializeTask>
 }
 
+type TaskSnapshotEventPayload = {
+  type: 'task.snapshot'
+  tasks: ReturnType<typeof serializeTask>[]
+  serverTime: number
+}
+
+type TaskConnectedEventPayload = {
+  type: 'connected'
+  workerId: string
+  eventCursor: string | null
+  serverTime: number
+}
+
+type TaskEventPayload = TaskUpdateEventPayload
+type TaskEventClientPayload = TaskEventPayload | TaskSnapshotEventPayload | TaskConnectedEventPayload
+
 type TaskEventClient = {
   id: string
   tenantId: string
-  write: (payload: TaskEventPayload | { type: 'connected'; workerId: string }) => void
+  write: (payload: TaskEventClientPayload, eventId?: string) => void
   close: () => void
 }
 
@@ -73,6 +93,7 @@ let taskQueueDraining = false
 let taskWorkerClosed = false
 let taskRecoveryTimer: NodeJS.Timeout | null = null
 let activeBetterAuth: AppAuth | null = null
+let lastTaskEventPruneAt = 0
 
 type AuthContext = {
   user: User
@@ -1062,26 +1083,137 @@ async function loadTaskWithRelations(taskId: string, tenantId?: string): Promise
   })
 }
 
-function publishTaskEvent(tenantId: string, payload: TaskEventPayload): void {
+function parseTaskEventCursor(value: unknown): bigint | null {
+  const raw = Array.isArray(value) ? value[0] : value
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null
+  try {
+    return BigInt(raw.trim())
+  } catch {
+    return null
+  }
+}
+
+function writeTaskEventToClients(tenantId: string, payload: TaskEventClientPayload, eventId?: string): void {
   const clients = taskEventClients.get(tenantId)
   if (!clients?.size) return
   for (const client of [...clients]) {
     try {
-      client.write(payload)
+      client.write(payload, eventId)
     } catch {
       client.close()
     }
   }
 }
 
+function maybePruneOldTaskEvents(): void {
+  const now = Date.now()
+  if (now - lastTaskEventPruneAt < TASK_EVENT_PRUNE_INTERVAL_MS) return
+  lastTaskEventPruneAt = now
+  void prisma.taskEvent.deleteMany({
+    where: {
+      createdAt: {
+        lt: new Date(now - TASK_EVENT_RETENTION_MS),
+      },
+    },
+  }).catch((error) => {
+    console.warn('Failed to prune old task events:', error)
+  })
+}
+
+async function publishTaskEvent(tenantId: string, payload: TaskEventPayload): Promise<void> {
+  let eventId: string | undefined
+  try {
+    const event = await prisma.taskEvent.create({
+      data: {
+        tenantId,
+        taskId: payload.task.id,
+        type: payload.type,
+        phase: payload.phase,
+        payload: payload as unknown as Prisma.InputJsonValue,
+      },
+      select: { id: true },
+    })
+    eventId = event.id.toString()
+  } catch (error) {
+    console.warn('Failed to persist task event:', error)
+  }
+  maybePruneOldTaskEvents()
+  writeTaskEventToClients(tenantId, payload, eventId)
+}
+
 async function publishTaskById(taskId: string, phase: TaskEventPhase): Promise<void> {
   const task = await loadTaskWithRelations(taskId)
   if (!task) return
-  publishTaskEvent(task.tenantId, {
+  await publishTaskEvent(task.tenantId, {
     type: 'task.updated',
     phase,
     task: serializeTask(task),
   })
+}
+
+async function latestTaskEventId(tenantId: string): Promise<bigint | null> {
+  const event = await prisma.taskEvent.findFirst({
+    where: { tenantId },
+    orderBy: { id: 'desc' },
+    select: { id: true },
+  })
+  return event?.id ?? null
+}
+
+async function loadTaskEventSnapshot(tenantId: string): Promise<ReturnType<typeof serializeTask>[]> {
+  const recentTasks = await prisma.task.findMany({
+    where: { tenantId },
+    orderBy: { createdAt: 'desc' },
+    take: TASK_EVENT_SNAPSHOT_TASK_LIMIT,
+    include: {
+      providerProfile: true,
+      images: {
+        include: { imageAsset: true },
+      },
+    },
+  })
+  const recentIds = new Set(recentTasks.map((task) => task.id))
+  const runningTasks = await prisma.task.findMany({
+    where: {
+      tenantId,
+      status: TaskStatus.RUNNING,
+      ...(recentIds.size ? { id: { notIn: [...recentIds] } } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    include: {
+      providerProfile: true,
+      images: {
+        include: { imageAsset: true },
+      },
+    },
+  })
+
+  return [...runningTasks, ...recentTasks]
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    .map(serializeTask)
+}
+
+async function replayStoredTaskEvents(input: {
+  tenantId: string
+  cursor: bigint | null
+  maxId?: bigint | null
+  write: (payload: TaskEventClientPayload, eventId?: string) => void
+}): Promise<void> {
+  if (input.cursor == null) return
+  const events = await prisma.taskEvent.findMany({
+    where: {
+      tenantId: input.tenantId,
+      id: {
+        gt: input.cursor,
+        ...(input.maxId != null ? { lte: input.maxId } : {}),
+      },
+    },
+    orderBy: { id: 'asc' },
+    take: TASK_EVENT_REPLAY_LIMIT,
+  })
+  for (const event of events) {
+    input.write(event.payload as unknown as TaskEventPayload, event.id.toString())
+  }
 }
 
 function addTaskEventClient(client: TaskEventClient): void {
@@ -1251,7 +1383,7 @@ async function markTaskError(taskId: string, error: unknown, rawResponsePayload?
       },
     },
   })
-  publishTaskEvent(failedTask.tenantId, {
+  await publishTaskEvent(failedTask.tenantId, {
     type: 'task.updated',
     phase: 'error',
     task: serializeTask(failedTask),
@@ -1270,7 +1402,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
     const existingOutputs = task.images.filter((image) => image.role === TaskImageRole.OUTPUT)
     if (existingOutputs.length > 0 && existingOutputs.every((image) => image.imageAsset.status === ImageStatus.READY)) {
       const finished = await maybeFinishTask(task.id, task.tenantId)
-      publishTaskEvent(task.tenantId, {
+      await publishTaskEvent(task.tenantId, {
         type: 'task.updated',
         phase: 'done',
         task: serializeTask(finished),
@@ -1350,7 +1482,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
         imageCount: providerResult.images.length,
       },
     })
-    publishTaskEvent(task.tenantId, {
+    await publishTaskEvent(task.tenantId, {
       type: 'task.updated',
       phase: 'done',
       task: serializeTask(finishedTask),
@@ -2657,6 +2789,10 @@ export async function buildApp() {
     const auth = await requireAuth(request, reply)
     if (!auth) return
 
+    const query = request.query as { cursor?: string | string[] }
+    const requestCursor = parseTaskEventCursor(request.headers['last-event-id']) ?? parseTaskEventCursor(query.cursor)
+    const replayHighWatermark = await latestTaskEventId(auth.tenant.id)
+
     reply.hijack()
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -2668,7 +2804,8 @@ export async function buildApp() {
     const writeRaw = (chunk: string) => {
       if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.write(chunk)
     }
-    const writePayload = (payload: TaskEventPayload | { type: 'connected'; workerId: string }) => {
+    const writePayload = (payload: TaskEventClientPayload, eventId?: string) => {
+      if (eventId) writeRaw(`id: ${eventId}\n`)
       writeRaw(`data: ${JSON.stringify(payload)}\n\n`)
     }
     const client: TaskEventClient = {
@@ -2688,9 +2825,30 @@ export async function buildApp() {
       removeTaskEventClient(client)
     }
 
-    addTaskEventClient(client)
     request.raw.on('close', cleanup)
-    writePayload({ type: 'connected', workerId: TASK_WORKER_ID })
+    writePayload({
+      type: 'connected',
+      workerId: TASK_WORKER_ID,
+      eventCursor: replayHighWatermark?.toString() ?? null,
+      serverTime: Date.now(),
+    })
+    await replayStoredTaskEvents({
+      tenantId: auth.tenant.id,
+      cursor: requestCursor,
+      maxId: replayHighWatermark,
+      write: writePayload,
+    })
+    writePayload({
+      type: 'task.snapshot',
+      tasks: await loadTaskEventSnapshot(auth.tenant.id),
+      serverTime: Date.now(),
+    })
+    addTaskEventClient(client)
+    await replayStoredTaskEvents({
+      tenantId: auth.tenant.id,
+      cursor: replayHighWatermark,
+      write: writePayload,
+    })
   })
 
   app.get('/api/tasks/:taskId', async (request, reply) => {
@@ -2787,7 +2945,7 @@ export async function buildApp() {
           hasMask: Boolean(maskImage),
         },
       })
-      publishTaskEvent(auth.tenant.id, {
+      await publishTaskEvent(auth.tenant.id, {
         type: 'task.updated',
         phase: 'queued',
         task: serializeTask(task),

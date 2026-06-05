@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import type { AddressInfo } from 'node:net'
 import { buildApp } from '../src/server.js'
 import { prisma } from '../src/prisma.js'
 import { ensureBucket, readObjectBytes } from '../src/storage.js'
@@ -25,6 +26,7 @@ function cookieHeader(response: { headers: Record<string, string | string[] | un
 }
 
 async function clearDb() {
+  await prisma.taskEvent.deleteMany()
   await prisma.taskImage.deleteMany()
   await prisma.task.deleteMany()
   await prisma.imageAsset.deleteMany()
@@ -93,6 +95,34 @@ async function waitForTask(app: FastifyInstance, cookie: string, taskId: string)
   throw new Error('Timed out waiting for async task')
 }
 
+async function readSseUntilSnapshot(app: FastifyInstance, cookie: string): Promise<string> {
+  if (!app.server.listening) await app.listen({ host: '127.0.0.1', port: 0 })
+  const address = app.server.address() as AddressInfo
+  const controller = new AbortController()
+  const response = await fetch(`http://127.0.0.1:${address.port}/api/tasks/events?cursor=0`, {
+    headers: { cookie },
+    signal: controller.signal,
+  })
+  expect(response.status).toBe(200)
+  expect(response.headers.get('content-type')).toContain('text/event-stream')
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('Missing SSE response body')
+  const decoder = new TextDecoder()
+  let text = ''
+  try {
+    for (let index = 0; index < 20; index++) {
+      const { value, done } = await reader.read()
+      if (done) break
+      text += decoder.decode(value, { stream: true })
+      if (text.includes('"type":"task.snapshot"')) break
+    }
+  } finally {
+    controller.abort()
+    reader.cancel().catch(() => undefined)
+  }
+  return text
+}
+
 describeWithDb('async SaaS task execution', () => {
   let app: FastifyInstance
 
@@ -153,6 +183,14 @@ describeWithDb('async SaaS task execution', () => {
     expect(image.sha256).toMatch(/^[a-f0-9]{64}$/)
     expect((await readObjectBytes(image.bucket, image.objectKey)).byteLength).toBe(image.byteSize)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(await prisma.taskEvent.count({ where: { taskId: createdPayload.task.id } })).toBeGreaterThanOrEqual(3)
+
+    vi.unstubAllGlobals()
+    const sseText = await readSseUntilSnapshot(app, cookie)
+    expect(sseText).toContain('id:')
+    expect(sseText).toContain('"type":"task.updated"')
+    expect(sseText).toContain('"type":"task.snapshot"')
+    expect(sseText).toContain(createdPayload.task.id)
   })
 
   it('runs OpenAI-compatible image count as concurrent single-image generation requests', async () => {
