@@ -1835,7 +1835,15 @@ async function proxyBetterAuthRequest(
   reply: FastifyReply,
   pathOverride?: string,
 ) {
-  const targetUrl = new URL(pathOverride ?? request.url, config.betterAuthUrl)
+  const targetPath = pathOverride ?? request.url
+  const targetUrl = new URL(targetPath, config.betterAuthUrl)
+  if (
+    !config.auth.emailPasswordRegistrationEnabled &&
+    request.method === 'POST' &&
+    targetUrl.pathname === `${BETTER_AUTH_BASE_PATH}/sign-up/email`
+  ) {
+    return reply.status(403).send({ error: '邮箱密码注册已关闭' })
+  }
   const headers = betterAuthHeaders(request, { assumeTrustedOrigin: true })
   if (request.body != null && !headers.get('content-type')) headers.set('content-type', 'application/json')
   const response = await betterAuthInstance().handler(new Request(targetUrl, {
@@ -1918,6 +1926,7 @@ export async function buildApp() {
   })
 
   app.post('/api/auth/register', async (request, reply) => {
+    if (!config.auth.emailPasswordRegistrationEnabled) return reply.status(403).send({ error: '邮箱密码注册已关闭' })
     try {
       const body = parseBody(registerSchema, request.body)
       const email = normalizeEmail(body.email)
@@ -2249,6 +2258,9 @@ export async function buildApp() {
   })
 
   app.get('/api/auth/oauth-options', async () => ({
+    emailPassword: {
+      registrationEnabled: config.auth.emailPasswordRegistrationEnabled,
+    },
     github: {
       enabled: githubOAuthEnabled(),
     },

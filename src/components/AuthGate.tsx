@@ -27,6 +27,8 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   const [submitting, setSubmitting] = useState(false)
   const [oauthOptions, setOauthOptions] = useState<OAuthOptions | null>(null)
   const readySessionId = useRef<string | null>(null)
+  const emailPasswordRegistrationEnabled = oauthOptions?.emailPassword?.registrationEnabled !== false
+  const registerMode = mode === 'register' && emailPasswordRegistrationEnabled
 
   const applySession = (nextSession: SaasSession) => {
     const profiles = nextSession.providerProfiles.map(saasProviderProfileToApiProfile)
@@ -46,20 +48,22 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   useEffect(() => {
     if (!isSaasMode()) return
     let cancelled = false
-    void getOAuthOptions()
-      .then((options) => {
-        if (!cancelled) setOauthOptions(options)
-      })
-      .catch(() => {
-        if (!cancelled) setOauthOptions({ github: { enabled: false }, google: { enabled: false } })
-      })
-    void getCurrentSession()
-      .then((nextSession) => {
-        if (!cancelled) applySession(nextSession)
-      })
-      .catch(() => {
-        if (!cancelled) setSession(null)
-      })
+    void Promise.all([
+      getOAuthOptions()
+        .then((options) => {
+          if (!cancelled) setOauthOptions(options)
+        })
+        .catch(() => {
+          if (!cancelled) setOauthOptions({ emailPassword: { registrationEnabled: true }, github: { enabled: false }, google: { enabled: false } })
+        }),
+      getCurrentSession()
+        .then((nextSession) => {
+          if (!cancelled) applySession(nextSession)
+        })
+        .catch(() => {
+          if (!cancelled) setSession(null)
+        }),
+    ])
       .finally(() => {
         if (!cancelled) setLoading(false)
       })
@@ -67,6 +71,10 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (!emailPasswordRegistrationEnabled && mode === 'register') setMode('login')
+  }, [emailPasswordRegistrationEnabled, mode])
 
   useEffect(() => {
     if (!session || readySessionId.current === session.user.id) return
@@ -79,11 +87,15 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
     setError('')
+    if (mode === 'register' && !emailPasswordRegistrationEnabled) {
+      setError('邮箱密码注册已关闭')
+      return
+    }
     setSubmitting(true)
     try {
-      const nextSession = mode === 'login'
-        ? await login(email, password)
-        : await register(email, password, tenantName || undefined)
+      const nextSession = registerMode
+        ? await register(email, password, tenantName || undefined)
+        : await login(email, password)
       applySession(nextSession)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -133,22 +145,24 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
             <h1 className="text-lg font-bold tracking-tight">GPT Image Playground</h1>
             <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">登录后进入画廊</p>
           </div>
-          <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-gray-100/70 p-1 dark:border-white/[0.08] dark:bg-white/[0.04]">
-            <button
-              type="button"
-              onClick={() => setMode('login')}
-              className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${mode === 'login' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
-            >
-              登录
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode('register')}
-              className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${mode === 'register' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
-            >
-              注册
-            </button>
-          </div>
+          {emailPasswordRegistrationEnabled && (
+            <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-gray-100/70 p-1 dark:border-white/[0.08] dark:bg-white/[0.04]">
+              <button
+                type="button"
+                onClick={() => setMode('login')}
+                className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${mode === 'login' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                登录
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('register')}
+                className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${mode === 'register' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                注册
+              </button>
+            </div>
+          )}
           {(oauthOptions?.github?.enabled || oauthOptions?.google?.enabled) && (
             <>
               <div className="mb-4 grid gap-2">
@@ -200,12 +214,12 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-              minLength={mode === 'register' ? 8 : undefined}
+              autoComplete={registerMode ? 'new-password' : 'current-password'}
+              minLength={registerMode ? 8 : undefined}
               required
             />
           </label>
-          {mode === 'register' && (
+          {registerMode && (
             <label className="mb-3 block">
               <span className="mb-1 block text-sm font-medium">租户名称</span>
               <TextInput
@@ -221,7 +235,7 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
             </div>
           )}
           <Button type="submit" disabled={submitting} className="w-full">
-            {submitting ? '提交中...' : mode === 'login' ? '登录' : '注册并进入'}
+            {submitting ? '提交中...' : registerMode ? '注册并进入' : '登录'}
           </Button>
         </form>
       </div>

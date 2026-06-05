@@ -71,6 +71,7 @@ export function createBetterAuth() {
     }),
     emailAndPassword: {
       enabled: true,
+      disableSignUp: !config.auth.emailPasswordRegistrationEnabled,
       minPasswordLength: 8,
       maxPasswordLength: 200,
       password: {

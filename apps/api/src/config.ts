@@ -34,6 +34,11 @@ export const config = {
     .split(',')
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean),
+  auth: {
+    get emailPasswordRegistrationEnabled() {
+      return readBoolean('EMAIL_PASSWORD_REGISTRATION_ENABLED', true)
+    },
+  },
   security: {
     allowPrivateProviderUrls: readBoolean('ALLOW_PRIVATE_PROVIDER_URLS', false),
     rateLimitEnabled: readBoolean('RATE_LIMIT_ENABLED', true),

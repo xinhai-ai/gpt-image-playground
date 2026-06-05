@@ -267,6 +267,9 @@ export function updateSaasClientPreferences(preferences: SaasClientPreferences):
 }
 
 export interface OAuthOptions {
+  emailPassword?: {
+    registrationEnabled: boolean
+  }
   github?: {
     enabled: boolean
   }
