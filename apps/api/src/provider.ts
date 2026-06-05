@@ -94,6 +94,56 @@ function mergeActualParams(...sources: Array<Partial<TaskParams> | undefined>): 
   return Object.keys(merged).length ? merged : undefined
 }
 
+function requestedImageCount(params: TaskParams): number {
+  const n = Number.isFinite(params.n) ? Math.trunc(params.n) : 1
+  return Math.max(1, Math.min(10, n))
+}
+
+function singleImageInput(input: ProviderCallInput): ProviderCallInput {
+  return {
+    ...input,
+    params: {
+      ...input.params,
+      n: 1,
+    },
+  }
+}
+
+function mergeProviderResults(results: ProviderCallResult[], requestedCount: number): ProviderCallResult {
+  const images = results.flatMap((result) => result.images).slice(0, requestedCount)
+  if (images.length < requestedCount) {
+    throw new Error(`Provider 只返回 ${images.length}/${requestedCount} 张图片`)
+  }
+
+  const rawImageUrls = results.flatMap((result) => result.rawImageUrls ?? [])
+  const rawResponsePayloads = results
+    .map((result) => result.rawResponsePayload)
+    .filter((payload): payload is string => Boolean(payload))
+
+  return {
+    images,
+    rawImageUrls: rawImageUrls.length ? rawImageUrls.slice(0, requestedCount) : undefined,
+    rawResponsePayload: rawResponsePayloads.length ? JSON.stringify(rawResponsePayloads) : undefined,
+    actualParams: mergeActualParams(...results.map((result) => result.actualParams), { n: images.length }),
+  }
+}
+
+async function callConcurrentSingleImageRequests(
+  input: ProviderCallInput,
+  requestCount: number,
+  callSingle: (input: ProviderCallInput) => Promise<ProviderCallResult>,
+): Promise<ProviderCallResult> {
+  const requests = Array.from({ length: requestCount }, () => callSingle(singleImageInput(input)))
+  const settled = await Promise.allSettled(requests)
+  const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (rejected) throw rejected.reason
+
+  return mergeProviderResults(
+    settled.map((result) => (result as PromiseFulfilledResult<ProviderCallResult>).value),
+    requestCount,
+  )
+}
+
 async function getApiErrorMessage(response: Response): Promise<string> {
   try {
     const payload = await response.json() as unknown
@@ -222,7 +272,7 @@ function parseImagesPayload(payload: unknown, params: TaskParams): ProviderCallR
   }
 }
 
-async function callOpenAIImages(input: ProviderCallInput): Promise<ProviderCallResult> {
+async function callOpenAIImagesSingle(input: ProviderCallInput): Promise<ProviderCallResult> {
   const { profile, inputImages, maskImage } = input
   const isEdit = inputImages.length > 0
   const headers = createAuthHeaders(profile)
@@ -257,6 +307,12 @@ async function callOpenAIImages(input: ProviderCallInput): Promise<ProviderCallR
     body: JSON.stringify(createOpenAIImageBody(input)),
   }, timeoutSeconds)
   return parseImagesPayload(payload, input.params)
+}
+
+async function callOpenAIImages(input: ProviderCallInput): Promise<ProviderCallResult> {
+  const n = requestedImageCount(input.params)
+  if (n <= 1) return callOpenAIImagesSingle(input)
+  return callConcurrentSingleImageRequests(input, n, callOpenAIImagesSingle)
 }
 
 function getResponsesImageResultBase64(result: unknown): string | undefined {
@@ -319,7 +375,7 @@ function parseResponsesPayload(payload: unknown, params: TaskParams): ProviderCa
   }
 }
 
-async function callOpenAIResponses(input: ProviderCallInput): Promise<ProviderCallResult> {
+async function callOpenAIResponsesSingle(input: ProviderCallInput): Promise<ProviderCallResult> {
   const { profile, params } = input
   const profileConfig = asConfig(profile)
   const imageTool: Record<string, unknown> = {
@@ -351,6 +407,12 @@ async function callOpenAIResponses(input: ProviderCallInput): Promise<ProviderCa
     }),
   }, getTimeoutSeconds(profile))
   return parseResponsesPayload(payload, params)
+}
+
+async function callOpenAIResponses(input: ProviderCallInput): Promise<ProviderCallResult> {
+  const n = requestedImageCount(input.params)
+  if (n <= 1) return callOpenAIResponsesSingle(input)
+  return callConcurrentSingleImageRequests(input, n, callOpenAIResponsesSingle)
 }
 
 function mapFalEndpoint(model: string, isEdit: boolean): string {

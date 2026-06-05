@@ -53,7 +53,10 @@ async function register(app: FastifyInstance): Promise<string> {
   return cookieHeader(response)
 }
 
-async function createProvider(app: FastifyInstance, cookie: string): Promise<string> {
+async function createProvider(app: FastifyInstance, cookie: string, overrides: {
+  apiMode?: 'images' | 'responses'
+  config?: Record<string, unknown>
+} = {}): Promise<string> {
   const response = await app.inject({
     method: 'POST',
     url: '/api/admin/channels',
@@ -63,8 +66,9 @@ async function createProvider(app: FastifyInstance, cookie: string): Promise<str
       provider: 'openai',
       baseUrl: 'https://api.openai.com/v1',
       model: 'gpt-image-2',
-      apiMode: 'images',
+      apiMode: overrides.apiMode ?? 'images',
       apiKey: 'sk-test-provider',
+      ...(overrides.config ? { config: overrides.config } : {}),
     },
   })
   expect(response.statusCode).toBe(201)
@@ -149,5 +153,84 @@ describeWithDb('async SaaS task execution', () => {
     expect(image.sha256).toMatch(/^[a-f0-9]{64}$/)
     expect((await readObjectBytes(image.bucket, image.objectKey)).byteLength).toBe(image.byteSize)
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('runs OpenAI-compatible image count as concurrent single-image generation requests', async () => {
+    const cookie = await register(app)
+    const providerProfileId = await createProvider(app, cookie)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      expect(input.toString()).toBe('https://api.openai.com/v1/images/generations')
+      const body = JSON.parse(String(init?.body ?? '{}')) as { n?: number }
+      expect(body.n).toBeUndefined()
+      return new Response(JSON.stringify({
+        data: [{
+          b64_json: TINY_PNG_BASE64,
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie },
+      payload: {
+        prompt: 'make two tiny images',
+        params: { ...DEFAULT_TASK_PARAMS, n: 2 },
+        inputImageIds: [],
+        maskImageId: null,
+        providerProfileId,
+      },
+    })
+    expect(created.statusCode).toBe(202)
+    const createdPayload = created.json() as { task: { id: string } }
+
+    const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
+    expect(doneTask.status).toBe('done')
+    expect(doneTask.outputImages).toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('runs Responses image count as concurrent single-image response requests', async () => {
+    const cookie = await register(app)
+    const providerProfileId = await createProvider(app, cookie, { apiMode: 'responses' })
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      expect(input.toString()).toBe('https://api.openai.com/v1/responses')
+      const body = JSON.parse(String(init?.body ?? '{}')) as { tools?: Array<{ type?: string }> }
+      expect(body.tools?.[0]?.type).toBe('image_generation')
+      return new Response(JSON.stringify({
+        output: [{
+          type: 'image_generation_call',
+          result: TINY_PNG_BASE64,
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie },
+      payload: {
+        prompt: 'make two tiny response images',
+        params: { ...DEFAULT_TASK_PARAMS, n: 2 },
+        inputImageIds: [],
+        maskImageId: null,
+        providerProfileId,
+      },
+    })
+    expect(created.statusCode).toBe(202)
+    const createdPayload = created.json() as { task: { id: string } }
+
+    const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
+    expect(doneTask.status).toBe('done')
+    expect(doneTask.outputImages).toHaveLength(2)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 })
