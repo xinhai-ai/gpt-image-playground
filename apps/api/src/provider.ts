@@ -109,12 +109,48 @@ function singleImageInput(input: ProviderCallInput): ProviderCallInput {
   }
 }
 
-function mergeProviderResults(results: ProviderCallResult[], requestedCount: number): ProviderCallResult {
-  const images = results.flatMap((result) => result.images).slice(0, requestedCount)
-  if (images.length < requestedCount) {
-    throw new Error(`Provider 只返回 ${images.length}/${requestedCount} 张图片`)
-  }
+interface ProviderRequestFailure {
+  requestIndex: number
+  message: string
+  rawResponsePayload?: string
+}
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error.trim()) return error
+  return 'Provider request failed'
+}
+
+function getErrorRawResponsePayload(error: unknown): string | undefined {
+  if (error instanceof Error && 'rawResponsePayload' in error) {
+    const rawResponsePayload = (error as Error & { rawResponsePayload?: unknown }).rawResponsePayload
+    return typeof rawResponsePayload === 'string' && rawResponsePayload ? rawResponsePayload : undefined
+  }
+  return undefined
+}
+
+function serializeProviderRequestFailure(error: unknown, requestIndex: number): ProviderRequestFailure {
+  return {
+    requestIndex,
+    message: getErrorMessage(error),
+    rawResponsePayload: getErrorRawResponsePayload(error),
+  }
+}
+
+function combineRawResponsePayloads(payloads: string[], failures: ProviderRequestFailure[]): string | undefined {
+  if (!payloads.length && !failures.length) return undefined
+  return JSON.stringify({
+    payloads,
+    failedRequests: failures,
+  })
+}
+
+function mergeProviderResults(
+  results: ProviderCallResult[],
+  requestedCount: number,
+  failures: ProviderRequestFailure[] = [],
+): ProviderCallResult {
+  const images = results.flatMap((result) => result.images).slice(0, requestedCount)
   const rawImageUrls = results.flatMap((result) => result.rawImageUrls ?? [])
   const rawResponsePayloads = results
     .map((result) => result.rawResponsePayload)
@@ -123,7 +159,7 @@ function mergeProviderResults(results: ProviderCallResult[], requestedCount: num
   return {
     images,
     rawImageUrls: rawImageUrls.length ? rawImageUrls.slice(0, requestedCount) : undefined,
-    rawResponsePayload: rawResponsePayloads.length ? JSON.stringify(rawResponsePayloads) : undefined,
+    rawResponsePayload: combineRawResponsePayloads(rawResponsePayloads, failures),
     actualParams: mergeActualParams(...results.map((result) => result.actualParams), { n: images.length }),
   }
 }
@@ -135,12 +171,22 @@ async function callConcurrentSingleImageRequests(
 ): Promise<ProviderCallResult> {
   const requests = Array.from({ length: requestCount }, () => callSingle(singleImageInput(input)))
   const settled = await Promise.allSettled(requests)
-  const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected')
-  if (rejected) throw rejected.reason
+  const failures = settled.flatMap((result, index) => result.status === 'rejected'
+    ? [serializeProviderRequestFailure(result.reason, index)]
+    : [])
+  const fulfilled = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+
+  if (!fulfilled.length && failures.length) {
+    const firstRejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    const error = firstRejected?.reason instanceof Error ? firstRejected.reason : new Error(failures[0]!.message)
+    ;(error as Error & { rawResponsePayload?: string }).rawResponsePayload = combineRawResponsePayloads([], failures)
+    throw error
+  }
 
   return mergeProviderResults(
-    settled.map((result) => (result as PromiseFulfilledResult<ProviderCallResult>).value),
+    fulfilled,
     requestCount,
+    failures,
   )
 }
 

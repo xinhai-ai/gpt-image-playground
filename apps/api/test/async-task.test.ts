@@ -232,6 +232,60 @@ describeWithDb('async SaaS task execution', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps successful images when one concurrent OpenAI-compatible request fails', async () => {
+    const cookie = await register(app)
+    const providerProfileId = await createProvider(app, cookie)
+    let requestIndex = 0
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      expect(input.toString()).toBe('https://api.openai.com/v1/images/generations')
+      const body = JSON.parse(String(init?.body ?? '{}')) as { n?: number }
+      expect(body.n).toBeUndefined()
+      const currentIndex = requestIndex++
+      if (currentIndex === 1) {
+        return new Response(JSON.stringify({
+          error: { message: 'HTTP 504' },
+        }), {
+          status: 504,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({
+        data: [{
+          b64_json: TINY_PNG_BASE64,
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/tasks',
+      headers: { cookie },
+      payload: {
+        prompt: 'make two tiny images with one provider failure',
+        params: { ...DEFAULT_TASK_PARAMS, n: 2 },
+        inputImageIds: [],
+        maskImageId: null,
+        providerProfileId,
+      },
+    })
+    expect(created.statusCode).toBe(202)
+    const createdPayload = created.json() as { task: { id: string } }
+
+    const doneTask = await waitForTask(app, cookie, createdPayload.task.id)
+    expect(doneTask.status).toBe('done')
+    expect(doneTask.outputImages).toHaveLength(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    const task = await prisma.task.findUniqueOrThrow({ where: { id: createdPayload.task.id } })
+    expect(task.error).toBeNull()
+    expect(task.actualParams).toMatchObject({ n: 1 })
+    expect(task.rawResponsePayload).toContain('HTTP 504')
+  })
+
   it('deletes tasks on the backend and cleans orphaned output records', async () => {
     const cookie = await register(app)
     const providerProfileId = await createProvider(app, cookie)
