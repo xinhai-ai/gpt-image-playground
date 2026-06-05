@@ -117,9 +117,9 @@ describeWithDb('provider profile routes', () => {
       name: 'Renamed OpenAI',
       provider: 'openai',
       model: 'gpt-image-2',
+      apiMode: 'images',
     })
     expect(profile?.baseUrl).toBeUndefined()
-    expect(profile?.apiMode).toBeUndefined()
     expect(profile?.config).toBeUndefined()
     expect(profile?.hasApiKey).toBeUndefined()
     expect(profile?.apiKey).toBeUndefined()

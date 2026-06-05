@@ -27,6 +27,7 @@ export interface SaasSession {
     name: string
     provider: string
     model: string
+    apiMode: ApiProfile['apiMode']
   }>
 }
 
@@ -319,7 +320,7 @@ export function saasProviderProfileToApiProfile(profile: SaasProviderProfile): A
     apiKey: '',
     model: profile.model,
     timeout: 600,
-    apiMode: 'images',
+    apiMode: profile.apiMode === 'responses' ? 'responses' : 'images',
     codexCli: false,
     apiProxy: false,
     responseFormatB64Json: false,

@@ -458,6 +458,7 @@ function serializeProviderProfile(profile: ProviderProfile) {
     name: profile.name,
     provider: profile.provider,
     model: profile.model,
+    apiMode: profile.apiMode,
   }
 }
 
