@@ -544,17 +544,9 @@ export default function TaskCard({
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">输入内容将在响应完成时接收</p>
               </div>
             ) : (
-              <>
-                <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3">
-                  {task.prompt || '(无提示词)'}
-                </p>
-                {runningProgressMessage && (
-                  <p className="mt-1 flex items-center gap-1.5 text-xs leading-5 text-blue-500 dark:text-blue-400">
-                    <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />
-                    <span className="truncate">{runningProgressMessage}</span>
-                  </p>
-                )}
-              </>
+              <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed line-clamp-3">
+                {task.prompt || '(无提示词)'}
+              </p>
             )}
           </div>
           <div className="mt-auto flex flex-col gap-1.5">
