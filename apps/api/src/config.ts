@@ -52,6 +52,11 @@ export const config = {
     clientSecret: readEnv('GITHUB_CLIENT_SECRET'),
     callbackUrl: readEnv('GITHUB_CALLBACK_URL'),
   },
+  googleOAuth: {
+    clientId: readEnv('GOOGLE_CLIENT_ID'),
+    clientSecret: readEnv('GOOGLE_CLIENT_SECRET'),
+    callbackUrl: readEnv('GOOGLE_CALLBACK_URL'),
+  },
   s3: {
     endpoint: readEnv('S3_ENDPOINT', 'http://localhost:9000'),
     publicEndpoint: readEnv('S3_PUBLIC_ENDPOINT', readEnv('S3_ENDPOINT', 'http://localhost:9000')),

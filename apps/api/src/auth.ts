@@ -17,13 +17,49 @@ function githubOAuthConfig() {
   }
 }
 
+function googleOAuthConfig() {
+  return {
+    clientId: process.env.GOOGLE_CLIENT_ID?.trim() || config.googleOAuth.clientId,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET?.trim() || config.googleOAuth.clientSecret,
+    callbackUrl: process.env.GOOGLE_CALLBACK_URL?.trim() || config.googleOAuth.callbackUrl,
+  }
+}
+
 export function githubOAuthEnabled(): boolean {
   const oauth = githubOAuthConfig()
   return Boolean(oauth.clientId && oauth.clientSecret)
 }
 
+export function googleOAuthEnabled(): boolean {
+  const oauth = googleOAuthConfig()
+  return Boolean(oauth.clientId && oauth.clientSecret)
+}
+
 export function createBetterAuth() {
-  const oauth = githubOAuthConfig()
+  const githubOAuth = githubOAuthConfig()
+  const googleOAuth = googleOAuthConfig()
+  const socialProviders = {
+    ...(githubOAuthEnabled()
+      ? {
+          github: {
+            clientId: githubOAuth.clientId,
+            clientSecret: githubOAuth.clientSecret,
+            scope: ['user:email'],
+            ...(githubOAuth.callbackUrl ? { redirectURI: githubOAuth.callbackUrl } : {}),
+          },
+        }
+      : {}),
+    ...(googleOAuthEnabled()
+      ? {
+          google: {
+            clientId: googleOAuth.clientId,
+            clientSecret: googleOAuth.clientSecret,
+            ...(googleOAuth.callbackUrl ? { redirectURI: googleOAuth.callbackUrl } : {}),
+          },
+        }
+      : {}),
+  }
+
   return betterAuth({
     appName: 'GPT Image Playground',
     baseURL: config.betterAuthUrl,
@@ -42,20 +78,11 @@ export function createBetterAuth() {
         verify: ({ hash, password }) => verifyPassword(password, hash),
       },
     },
-    socialProviders: githubOAuthEnabled()
-      ? {
-          github: {
-            clientId: oauth.clientId,
-            clientSecret: oauth.clientSecret,
-            scope: ['user:email'],
-            ...(oauth.callbackUrl ? { redirectURI: oauth.callbackUrl } : {}),
-          },
-        }
-      : undefined,
+    socialProviders: Object.keys(socialProviders).length ? socialProviders : undefined,
     account: {
       accountLinking: {
         enabled: true,
-        trustedProviders: ['github'],
+        trustedProviders: ['github', 'google'],
         requireLocalEmailVerified: false,
       },
     },

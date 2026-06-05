@@ -30,6 +30,7 @@ import {
   betterAuthHeaders,
   createBetterAuth,
   githubOAuthEnabled,
+  googleOAuthEnabled,
   parseBetterAuthJson,
   setBetterAuthCookies,
   type AppAuth,
@@ -2251,6 +2252,9 @@ export async function buildApp() {
     github: {
       enabled: githubOAuthEnabled(),
     },
+    google: {
+      enabled: googleOAuthEnabled(),
+    },
   }))
 
   app.get('/api/auth/github/start', async (request, reply) => {
@@ -2295,6 +2299,49 @@ export async function buildApp() {
     })) return
     const query = request.url.includes('?') ? request.url.slice(request.url.indexOf('?')) : ''
     return proxyBetterAuthRequest(request, reply, `${BETTER_AUTH_BASE_PATH}/callback/github${query}`)
+  })
+
+  app.get('/api/auth/google/start', async (request, reply) => {
+    if (!googleOAuthEnabled()) return reply.status(400).send({ error: 'Google OAuth 未配置' })
+    if (!await enforceRateLimit(request, reply, {
+      bucket: 'auth.google.start',
+      keyParts: [request.ip],
+      max: 20,
+      windowMs: 10 * 60_000,
+    })) return
+
+    const query = request.query as { redirect?: string }
+    const redirectPath = sanitizeRedirectPath(query.redirect)
+    try {
+      const response = await betterAuthInstance().api.signInSocial({
+        body: {
+          provider: 'google',
+          callbackURL: redirectPath,
+          disableRedirect: true,
+        },
+        headers: betterAuthHeaders(request, { assumeTrustedOrigin: true }),
+        asResponse: true,
+      })
+      setBetterAuthCookies(reply, response)
+      const payload = await parseBetterAuthJson<BetterAuthSocialStartPayload>(response)
+      if (!payload.url) return reply.status(502).send({ error: 'Google OAuth 未返回授权地址' })
+      return reply.status(302).header('Location', payload.url).send()
+    } catch (error) {
+      if (apiErrorStatus(error)) return sendBetterAuthError(reply, error)
+      throw error
+    }
+  })
+
+  app.get('/api/auth/google/callback', async (request, reply) => {
+    if (!googleOAuthEnabled()) return reply.status(400).send({ error: 'Google OAuth 未配置' })
+    if (!await enforceRateLimit(request, reply, {
+      bucket: 'auth.google.callback',
+      keyParts: [request.ip],
+      max: 30,
+      windowMs: 10 * 60_000,
+    })) return
+    const query = request.url.includes('?') ? request.url.slice(request.url.indexOf('?')) : ''
+    return proxyBetterAuthRequest(request, reply, `${BETTER_AUTH_BASE_PATH}/callback/google${query}`)
   })
 
   app.get('/api/tenants/current', async (request, reply) => {

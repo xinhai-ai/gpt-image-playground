@@ -11,7 +11,7 @@ import { formatBytes, formatDateTime } from '../lib/format'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { TextInput } from './ui/TextInput'
-import { GithubIcon } from './icons'
+import { GithubIcon, GoogleIcon } from './icons'
 
 function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
@@ -223,7 +223,8 @@ export default function AccountModal({ open, onClose }: { open: boolean; onClose
                     className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-sm text-gray-700 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200"
                   >
                     {provider === 'github' ? <GithubIcon className="h-4 w-4" /> : null}
-                    {provider === 'github' ? 'GitHub' : provider}
+                    {provider === 'google' ? <GoogleIcon className="h-4 w-4" /> : null}
+                    {provider === 'github' ? 'GitHub' : provider === 'google' ? 'Google' : provider}
                   </span>
                 ))}
               </div>
@@ -298,5 +299,4 @@ export default function AccountModal({ open, onClose }: { open: boolean; onClose
     </Modal>
   )
 }
-
 

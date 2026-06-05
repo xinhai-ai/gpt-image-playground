@@ -267,7 +267,10 @@ export function updateSaasClientPreferences(preferences: SaasClientPreferences):
 }
 
 export interface OAuthOptions {
-  github: {
+  github?: {
+    enabled: boolean
+  }
+  google?: {
     enabled: boolean
   }
 }
@@ -281,6 +284,13 @@ export function getGitHubOAuthStartUrl(redirectPath = '/'): string {
   if (redirectPath) search.set('redirect', redirectPath)
   const suffix = search.toString()
   return buildUrl(`/auth/github/start${suffix ? `?${suffix}` : ''}`)
+}
+
+export function getGoogleOAuthStartUrl(redirectPath = '/'): string {
+  const search = new URLSearchParams()
+  if (redirectPath) search.set('redirect', redirectPath)
+  const suffix = search.toString()
+  return buildUrl(`/auth/google/start${suffix ? `?${suffix}` : ''}`)
 }
 
 function readProviderConfig(profile: SaasProviderProfile): Record<string, unknown> {

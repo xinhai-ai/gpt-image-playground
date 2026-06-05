@@ -1,9 +1,9 @@
 import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from 'react'
-import { getCurrentSession, getGitHubOAuthStartUrl, getOAuthOptions, isSaasMode, login, logout, register, saasProviderProfileToApiProfile, type OAuthOptions, type SaasSession } from '../lib/saasApi'
+import { getCurrentSession, getGitHubOAuthStartUrl, getGoogleOAuthStartUrl, getOAuthOptions, isSaasMode, login, logout, register, saasProviderProfileToApiProfile, type OAuthOptions, type SaasSession } from '../lib/saasApi'
 import { useStore } from '../store'
 import { Button } from './ui/Button'
 import { TextInput } from './ui/TextInput'
-import { GithubIcon } from './icons'
+import { GithubIcon, GoogleIcon } from './icons'
 
 interface SaasAuthContextValue {
   session: SaasSession
@@ -51,7 +51,7 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
         if (!cancelled) setOauthOptions(options)
       })
       .catch(() => {
-        if (!cancelled) setOauthOptions({ github: { enabled: false } })
+        if (!cancelled) setOauthOptions({ github: { enabled: false }, google: { enabled: false } })
       })
     void getCurrentSession()
       .then((nextSession) => {
@@ -99,6 +99,13 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
     window.location.href = getGitHubOAuthStartUrl(redirectPath)
   }
 
+  const handleGoogleLogin = () => {
+    setError('')
+    setSubmitting(true)
+    const redirectPath = `${window.location.pathname}${window.location.search}${window.location.hash}` || '/'
+    window.location.href = getGoogleOAuthStartUrl(redirectPath)
+  }
+
   const handleLogout = async () => {
     await logout()
     window.location.reload()
@@ -142,18 +149,34 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
               注册
             </button>
           </div>
-          {oauthOptions?.github.enabled && (
+          {(oauthOptions?.github?.enabled || oauthOptions?.google?.enabled) && (
             <>
-              <Button
-                type="button"
-                tone="secondary"
-                onClick={handleGithubLogin}
-                disabled={submitting}
-                className="mb-4 w-full"
-              >
-                <GithubIcon className="h-4 w-4" />
-                使用 GitHub 登录
-              </Button>
+              <div className="mb-4 grid gap-2">
+                {oauthOptions?.google?.enabled && (
+                  <Button
+                    type="button"
+                    tone="secondary"
+                    onClick={handleGoogleLogin}
+                    disabled={submitting}
+                    className="w-full"
+                  >
+                    <GoogleIcon className="h-4 w-4" />
+                    使用 Google 登录
+                  </Button>
+                )}
+                {oauthOptions?.github?.enabled && (
+                  <Button
+                    type="button"
+                    tone="secondary"
+                    onClick={handleGithubLogin}
+                    disabled={submitting}
+                    className="w-full"
+                  >
+                    <GithubIcon className="h-4 w-4" />
+                    使用 GitHub 登录
+                  </Button>
+                )}
+              </div>
               <div className="mb-4 flex items-center gap-3 text-xs text-gray-400">
                 <div className="h-px flex-1 bg-gray-200 dark:bg-white/[0.08]" />
                 <span>或</span>
