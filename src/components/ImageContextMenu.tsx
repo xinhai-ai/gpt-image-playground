@@ -83,9 +83,10 @@ export default function ImageContextMenu() {
 
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation()
+    const previewSrc = menuInfo.src
     setMenuInfo(null)
     try {
-      await copyImageSourceToClipboard(getOriginalImageSrc())
+      await copyImageSourceToClipboard(previewSrc)
       showToast('图片已复制', 'success')
     } catch (err) {
       console.error(err)
