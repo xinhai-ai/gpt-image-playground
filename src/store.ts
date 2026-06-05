@@ -305,7 +305,7 @@ function scheduleIdleTask(callback: () => void, timeout = 2_000) {
 function scheduleSaasThumbnailFetch(ids: Iterable<string>, priority: 'visible' | 'background' = 'background') {
   if (!isSaasMode()) return
   for (const id of ids) {
-    if (!id || getCachedThumbnail(id) || saasThumbnailFetchRunningIds.has(id)) continue
+    if (!id || isDirectThumbnailUrl(getCachedThumbnail(id)) || saasThumbnailFetchRunningIds.has(id)) continue
     const currentPriority = saasThumbnailFetchIds.get(id)
     if (!currentPriority || priority === 'visible') saasThumbnailFetchIds.set(id, priority)
   }
