@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { createHash } from 'node:crypto'
 import { config } from './config.js'
+import { getClientIp } from './requestIp.js'
 
 type RateLimitEntry = {
   count: number
@@ -35,7 +36,7 @@ export async function enforceRateLimit(
   if (!config.security.rateLimitEnabled) return true
   const now = Date.now()
   sweep(now)
-  const key = `${input.bucket}:${stableKey([request.ip, ...(input.keyParts ?? [])])}`
+  const key = `${input.bucket}:${stableKey([getClientIp(request), ...(input.keyParts ?? [])])}`
   const current = buckets.get(key)
   if (!current || current.resetAt <= now) {
     buckets.set(key, { count: 1, resetAt: now + input.windowMs })

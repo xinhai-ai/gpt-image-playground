@@ -42,6 +42,7 @@ import { closeEmailOtpResources, emailOtpConfigured, emailOtpUnavailableReason, 
 import { prisma } from './prisma.js'
 import { callProvider, type ProviderImageResult, type ProviderProgressEvent, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
+import { getClientIp } from './requestIp.js'
 import { assertSafeOutboundUrl, normalizeOutboundHttpUrl } from './security.js'
 import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, deleteImageObjects, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes, thumbnailObjectKeyForImage } from './storage.js'
 
@@ -640,6 +641,7 @@ function clearBetterAuthCookies(reply: FastifyReply): void {
 
 async function createSessionCookieForUser(request: FastifyRequest, reply: FastifyReply, userId: string): Promise<void> {
   const authCookies = getBetterAuthCookies()
+  const clientIp = getClientIp(request)
   const token = randomBytes(32).toString('base64url')
   const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000)
   await prisma.session.create({
@@ -648,8 +650,8 @@ async function createSessionCookieForUser(request: FastifyRequest, reply: Fastif
       token,
       expiresAt,
       lastSeenAt: new Date(),
-      ip: request.ip,
-      ipAddress: request.ip,
+      ip: clientIp,
+      ipAddress: clientIp,
       userAgent: requestUserAgent(request),
     },
   })
@@ -805,12 +807,13 @@ async function getAuth(request: FastifyRequest, reply?: FastifyReply): Promise<A
     if (reply) clearBetterAuthCookies(reply)
     return null
   }
+  const clientIp = getClientIp(request)
   await prisma.session.updateMany({
     where: { token: session.session.token },
     data: {
       lastSeenAt: new Date(),
-      ip: request.ip,
-      ipAddress: request.ip,
+      ip: clientIp,
+      ipAddress: clientIp,
       userAgent: requestUserAgent(request),
     },
   }).catch(() => undefined)
@@ -873,7 +876,7 @@ async function writeUsageLog(input: {
       targetType: input.targetType,
       targetId: input.targetId,
       ...(input.detail !== undefined ? { detail: input.detail as Prisma.InputJsonValue } : {}),
-      ip: input.request?.ip,
+      ip: input.request ? getClientIp(input.request) : undefined,
       userAgent: input.request?.headers['user-agent'],
     },
   }).catch((error) => {
@@ -2166,7 +2169,7 @@ export async function buildApp() {
       if (!emailOtpConfigured()) return reply.status(503).send({ error: emailOtpUnavailableReason() })
       if (!await enforceRateLimit(request, reply, {
         bucket: 'auth.email_code.send',
-        keyParts: [request.ip, email],
+        keyParts: [email],
         max: 5,
         windowMs: 10 * 60_000,
       })) return
@@ -2195,7 +2198,7 @@ export async function buildApp() {
       if (!emailOtpConfigured()) return reply.status(503).send({ error: emailOtpUnavailableReason() })
       if (!await enforceRateLimit(request, reply, {
         bucket: 'auth.email_code.verify',
-        keyParts: [request.ip, email],
+        keyParts: [email],
         max: 10,
         windowMs: 10 * 60_000,
       })) return
@@ -2495,7 +2498,6 @@ export async function buildApp() {
     if (!githubOAuthEnabled()) return reply.status(400).send({ error: 'GitHub OAuth 未配置' })
     if (!await enforceRateLimit(request, reply, {
       bucket: 'auth.github.start',
-      keyParts: [request.ip],
       max: 20,
       windowMs: 10 * 60_000,
     })) return
@@ -2527,7 +2529,6 @@ export async function buildApp() {
     if (!githubOAuthEnabled()) return reply.status(400).send({ error: 'GitHub OAuth 未配置' })
     if (!await enforceRateLimit(request, reply, {
       bucket: 'auth.github.callback',
-      keyParts: [request.ip],
       max: 30,
       windowMs: 10 * 60_000,
     })) return
@@ -2539,7 +2540,6 @@ export async function buildApp() {
     if (!googleOAuthEnabled()) return reply.status(400).send({ error: 'Google OAuth 未配置' })
     if (!await enforceRateLimit(request, reply, {
       bucket: 'auth.google.start',
-      keyParts: [request.ip],
       max: 20,
       windowMs: 10 * 60_000,
     })) return
@@ -2570,7 +2570,6 @@ export async function buildApp() {
     if (!googleOAuthEnabled()) return reply.status(400).send({ error: 'Google OAuth 未配置' })
     if (!await enforceRateLimit(request, reply, {
       bucket: 'auth.google.callback',
-      keyParts: [request.ip],
       max: 30,
       windowMs: 10 * 60_000,
     })) return
