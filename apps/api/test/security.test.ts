@@ -83,7 +83,7 @@ describeWithDb('security controls', () => {
     const session = await register(app)
     const response = await app.inject({
       method: 'POST',
-      url: '/api/provider-profiles',
+      url: '/api/admin/channels',
       headers: { cookie: session.cookie },
       payload: {
         name: 'Localhost',

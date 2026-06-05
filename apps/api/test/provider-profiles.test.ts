@@ -59,12 +59,12 @@ describeWithDb('provider profile routes', () => {
     await clearDb()
   })
 
-  it('creates profiles without exposing API keys and does not clear a key on empty patch', async () => {
+  it('lets admins manage global channels without exposing API keys', async () => {
     const session = await register(app, 'owner@example.com')
 
     const created = await app.inject({
       method: 'POST',
-      url: '/api/provider-profiles',
+      url: '/api/admin/channels',
       headers: { cookie: session.cookie },
       payload: {
         name: 'Primary OpenAI',
@@ -77,19 +77,20 @@ describeWithDb('provider profile routes', () => {
       },
     })
     expect(created.statusCode).toBe(201)
-    const createdPayload = created.json() as { providerProfile: { id: string; hasApiKey: boolean; apiKey?: string; apiKeyEncrypted?: string } }
-    expect(createdPayload.providerProfile.hasApiKey).toBe(true)
-    expect(createdPayload.providerProfile.apiKey).toBeUndefined()
-    expect(createdPayload.providerProfile.apiKeyEncrypted).toBeUndefined()
+    const createdPayload = created.json() as { channel: { id: string; hasApiKey: boolean; apiKey?: string; apiKeyEncrypted?: string } }
+    expect(createdPayload.channel.hasApiKey).toBe(true)
+    expect(createdPayload.channel.apiKey).toBeUndefined()
+    expect(createdPayload.channel.apiKeyEncrypted).toBeUndefined()
 
     const storedAfterCreate = await prisma.providerProfile.findUniqueOrThrow({
-      where: { id: createdPayload.providerProfile.id },
+      where: { id: createdPayload.channel.id },
     })
+    expect(storedAfterCreate.tenantId).toBeNull()
     expect(decryptSecret(storedAfterCreate.apiKeyEncrypted)).toBe('sk-test-secret')
 
     const patched = await app.inject({
       method: 'PATCH',
-      url: `/api/provider-profiles/${createdPayload.providerProfile.id}`,
+      url: `/api/admin/channels/${createdPayload.channel.id}`,
       headers: { cookie: session.cookie },
       payload: {
         name: 'Renamed OpenAI',
@@ -98,7 +99,7 @@ describeWithDb('provider profile routes', () => {
     })
     expect(patched.statusCode).toBe(200)
     const storedAfterEmptyPatch = await prisma.providerProfile.findUniqueOrThrow({
-      where: { id: createdPayload.providerProfile.id },
+      where: { id: createdPayload.channel.id },
     })
     expect(storedAfterEmptyPatch.name).toBe('Renamed OpenAI')
     expect(decryptSecret(storedAfterEmptyPatch.apiKeyEncrypted)).toBe('sk-test-secret')
@@ -110,15 +111,31 @@ describeWithDb('provider profile routes', () => {
     })
     expect(me.statusCode).toBe(200)
     const mePayload = me.json() as { providerProfiles: Array<{ id: string; hasApiKey: boolean; apiKey?: string; apiKeyEncrypted?: string }> }
-    const profile = mePayload.providerProfiles.find((item) => item.id === createdPayload.providerProfile.id)
+    const profile = mePayload.providerProfiles.find((item) => item.id === createdPayload.channel.id)
     expect(profile?.hasApiKey).toBe(true)
     expect(profile?.apiKey).toBeUndefined()
     expect(profile?.apiKeyEncrypted).toBeUndefined()
   })
 
-  it('enforces tenant isolation and protects the last profile', async () => {
+  it('exposes shared channels as read-only to regular users', async () => {
     const owner = await register(app, 'owner@example.com')
     const other = await register(app, 'other@example.com')
+
+    expect(other.profileId).toBe(owner.profileId)
+
+    const forbiddenCreate = await app.inject({
+      method: 'POST',
+      url: '/api/provider-profiles',
+      headers: { cookie: other.cookie },
+      payload: {
+        name: 'Should not create',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-image-2',
+        apiMode: 'images',
+      },
+    })
+    expect(forbiddenCreate.statusCode).toBe(403)
 
     const isolatedPatch = await app.inject({
       method: 'PATCH',
@@ -126,7 +143,7 @@ describeWithDb('provider profile routes', () => {
       headers: { cookie: other.cookie },
       payload: { name: 'Should not update' },
     })
-    expect(isolatedPatch.statusCode).toBe(404)
+    expect(isolatedPatch.statusCode).toBe(403)
 
     const otherList = await app.inject({
       method: 'GET',
@@ -135,13 +152,13 @@ describeWithDb('provider profile routes', () => {
     })
     expect(otherList.statusCode).toBe(200)
     const otherPayload = otherList.json() as { providerProfiles: Array<{ id: string }> }
-    expect(otherPayload.providerProfiles.some((profile) => profile.id === owner.profileId)).toBe(false)
+    expect(otherPayload.providerProfiles.some((profile) => profile.id === owner.profileId)).toBe(true)
 
     const deleteLast = await app.inject({
       method: 'DELETE',
       url: `/api/provider-profiles/${owner.profileId}`,
       headers: { cookie: owner.cookie },
     })
-    expect(deleteLast.statusCode).toBe(400)
+    expect(deleteLast.statusCode).toBe(403)
   })
 })

@@ -179,9 +179,25 @@ describeWithDb('admin routes', () => {
   it('lets admins disable channels and prevents using disabled channels for tasks', async () => {
     const admin = await register(app, 'admin@example.com')
 
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/admin/channels',
+      headers: { cookie: admin.cookie },
+      payload: {
+        name: 'Disabled test channel',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-image-2',
+        apiMode: 'images',
+        apiKey: 'sk-test-provider',
+      },
+    })
+    expect(created.statusCode).toBe(201)
+    const channelId = (created.json() as { channel: { id: string } }).channel.id
+
     const disabled = await app.inject({
       method: 'PATCH',
-      url: `/api/admin/channels/${admin.profileId}`,
+      url: `/api/admin/channels/${channelId}`,
       headers: { cookie: admin.cookie },
       payload: { disabled: true },
     })
@@ -195,7 +211,7 @@ describeWithDb('admin routes', () => {
     })
     expect(channels.statusCode).toBe(200)
     const channelsPayload = channels.json() as { channels: Array<{ id: string; disabledAt: string | null }> }
-    expect(channelsPayload.channels.find((channel) => channel.id === admin.profileId)?.disabledAt).toBeTruthy()
+    expect(channelsPayload.channels.find((channel) => channel.id === channelId)?.disabledAt).toBeTruthy()
 
     const task = await app.inject({
       method: 'POST',
@@ -206,10 +222,54 @@ describeWithDb('admin routes', () => {
         params: DEFAULT_TASK_PARAMS,
         inputImageIds: [],
         maskImageId: null,
-        providerProfileId: admin.profileId,
+        providerProfileId: channelId,
       },
     })
     expect(task.statusCode).toBe(400)
     expect((task.json() as { error?: string }).error).toContain('已被后台停用')
+  })
+
+  it('lets admins update and delete unused global channels', async () => {
+    const admin = await register(app, 'admin@example.com')
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/admin/channels',
+      headers: { cookie: admin.cookie },
+      payload: {
+        name: 'Temporary channel',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-image-2',
+        apiMode: 'images',
+        apiKey: 'sk-test-provider',
+        config: { timeout: 120 },
+      },
+    })
+    expect(created.statusCode).toBe(201)
+    const channelId = (created.json() as { channel: { id: string; taskCount: number } }).channel.id
+
+    const updated = await app.inject({
+      method: 'PATCH',
+      url: `/api/admin/channels/${channelId}`,
+      headers: { cookie: admin.cookie },
+      payload: {
+        name: 'Updated channel',
+        model: 'gpt-image-3',
+        clearApiKey: true,
+      },
+    })
+    expect(updated.statusCode).toBe(200)
+    const updatedPayload = updated.json() as { channel: { name: string; model: string; hasApiKey: boolean } }
+    expect(updatedPayload.channel.name).toBe('Updated channel')
+    expect(updatedPayload.channel.model).toBe('gpt-image-3')
+    expect(updatedPayload.channel.hasApiKey).toBe(false)
+
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: `/api/admin/channels/${channelId}`,
+      headers: { cookie: admin.cookie },
+    })
+    expect(deleted.statusCode).toBe(200)
   })
 })

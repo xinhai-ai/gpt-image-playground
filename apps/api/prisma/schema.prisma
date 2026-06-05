@@ -150,7 +150,7 @@ model TenantMember {
 
 model ProviderProfile {
   id              String   @id @default(cuid())
-  tenantId        String
+  tenantId        String?
   name            String
   provider        String
   baseUrl         String
@@ -161,7 +161,7 @@ model ProviderProfile {
   disabledAt      DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
-  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant          Tenant?  @relation(fields: [tenantId], references: [id], onDelete: SetNull)
   tasks           Task[]
 
   @@index([tenantId])

@@ -26,9 +26,6 @@ GET  /api/tenants/current
 GET  /api/tenants/current/members
 
 GET    /api/provider-profiles
-POST   /api/provider-profiles
-PATCH  /api/provider-profiles/:profileId
-DELETE /api/provider-profiles/:profileId
 
 POST /api/storage/images
 POST /api/storage/images/:imageId/upload
@@ -52,7 +49,9 @@ PATCH /api/admin/users/:userId
 POST  /api/admin/users/:userId/revoke-sessions
 GET   /api/admin/logs
 GET   /api/admin/channels
+POST  /api/admin/channels
 PATCH /api/admin/channels/:profileId
+DELETE /api/admin/channels/:profileId
 GET   /api/admin/storage
 ```
 
@@ -81,10 +80,10 @@ In SaaS mode, platform administrators see the `后台` entry in the app header. 
 - Overview stats for users, tenants, tasks, images, storage, channels, and active sessions.
 - User listing, disable/enable actions, platform admin assignment, and forced session revocation.
 - Usage logs for auth, provider profile, image, task, and admin actions, including IP, user agent, and structured detail.
-- Channel listing and enable/disable controls for provider profiles.
+- Global channel creation, editing, enable/disable, and deletion for provider profiles.
 - Storage summary grouped by tenant, image purpose, and image status.
 
-Disabled users cannot log in and existing sessions are revoked. Disabled channels cannot be used for task creation or agent proxy requests.
+Provider profiles are platform-global (`tenantId = null`) and shared by all tenants. Users can list enabled channels and choose one by ID, but API keys, base URLs, models, modes, and provider config are managed only in the admin console. Disabled users cannot log in and existing sessions are revoked. Disabled channels cannot be used for task creation or agent proxy requests.
 
 ## Security And Performance Controls
 
@@ -94,6 +93,7 @@ Disabled users cannot log in and existing sessions are revoked. Disabled channel
 - Image generation tasks are executed asynchronously by the API service. `POST /api/tasks` creates a `RUNNING` task and returns immediately; the in-process worker calls the Provider, archives generated originals and WebP thumbnails to S3-compatible storage, and updates the task to `DONE` or `ERROR`.
 - The task worker is controlled by `TASK_WORKER_CONCURRENCY`, `TASK_WORKER_LEASE_SECONDS`, and `TASK_WORKER_RECOVER_INTERVAL_SECONDS`. The lease lets a restarted API instance pick up stale `RUNNING` tasks without relying on the browser connection.
 - The frontend subscribes to `GET /api/tasks/events` for SSE task updates and also periodically reconciles `GET /api/tasks`, so refreshes, tab closes, network drops, and SSE reconnects still recover server-side task state.
+- Provider API keys never leave the backend response surface. User-facing provider profile responses include only metadata such as `hasApiKey`; channel create/update/delete routes are platform-admin only.
 - Provider base URLs and provider-returned server-copy URLs are checked for SSRF risk. By default, localhost, private network, link-local, and metadata-style destinations are blocked. Set `ALLOW_PRIVATE_PROVIDER_URLS=true` only for trusted single-tenant/private deployments that need local model endpoints.
 - API-side image preprocessing limits upload bytes with `IMAGE_MAX_UPLOAD_BYTES` and decoded image pixels with `IMAGE_MAX_PIXELS`.
 - Compatibility signed-upload completion re-reads the S3 object and runs backend preprocessing before marking an image ready. Task creation only accepts `READY` input and mask images.

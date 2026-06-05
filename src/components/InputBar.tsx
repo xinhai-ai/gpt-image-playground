@@ -10,6 +10,7 @@ import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { getSafeBoundingClientRect } from '../lib/domRect'
 import { collectAgentRoundOutputImageSlots } from '../lib/agentImageReferences'
+import { isSaasMode } from '../lib/saasApi'
 import { useHintTooltip } from '../hooks/useHintTooltip'
 import { useTooltip } from '../hooks/useTooltip'
 import { downloadImageEntriesAsZip, downloadImageIds, formatExportFileTime, getTaskOutputImageZipEntries } from '../lib/downloadImages'
@@ -796,19 +797,19 @@ export default function InputBar() {
       ? settings
       : normalizeSettings({ ...settings, activeProfileId: activeProfile.id })
   ), [activeProfile.id, currentActiveProfile.id, settings])
-  const hasSubmitApiConfig = Boolean(activeProfile.apiKey)
+  const hasSubmitApiConfig = isSaasMode() ? Boolean(activeProfile.id) : Boolean(activeProfile.apiKey)
   const hasUploadingImage = inputImages.some((img) => img.uploading)
   const canSubmit = Boolean(prompt.trim() && hasSubmitApiConfig && !activeAgentIsRunning && !hasUploadingImage)
   const submitButtonAriaLabel = activeAgentIsRunning
     ? '停止生成'
     : hasSubmitApiConfig
     ? maskDraft ? '遮罩编辑' : '生成图像'
-    : '请先配置 API'
+    : isSaasMode() ? '暂无可用渠道' : '请先配置 API'
   const submitTooltipText = activeAgentIsRunning
     ? '停止生成'
     : hasUploadingImage
     ? '图片上传中，请稍候…'
-    : '尚未完成 API 配置，请在右上角设置中进行'
+    : isSaasMode() ? '暂无可用渠道，请联系管理员' : '尚未完成 API 配置，请在右上角设置中进行'
   const promptPlaceholder = '描述你想生成的图片，可输入 @ 来指定参考图...'
   const submitCurrentMode = useCallback(() => {
     if (appMode === 'agent') {

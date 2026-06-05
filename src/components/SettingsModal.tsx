@@ -29,7 +29,7 @@ import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_STREAM_PARTIAL_IMAGES, type ApiP
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { DEFAULT_DROPDOWN_MAX_HEIGHT, getDropdownMaxHeight } from '../lib/dropdown'
-import { createSaasProviderProfile, deleteSaasProviderProfile, isSaasMode, saasProviderProfileToApiProfile, updateSaasProviderProfile } from '../lib/saasApi'
+import { isSaasMode } from '../lib/saasApi'
 import Select from './Select'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
@@ -357,6 +357,7 @@ export default function SettingsModal() {
   const apiProxyAvailable = isApiProxyAvailable(apiProxyConfig)
   const apiProxyLocked = isApiProxyLocked(apiProxyConfig)
   const activeProfile = draft.profiles.find((profile) => profile.id === draft.activeProfileId) ?? draft.profiles[0] ?? getActiveApiProfile(draft)
+  const saasMode = isSaasMode()
   const activeProviderIsOpenAICompatible = isOpenAICompatibleProvider(draft, activeProfile.provider)
   const activeProviderUsesApiUrl = activeProviderIsOpenAICompatible || activeProfile.provider === 'fal'
   const activeCustomProvider = draft.customProviders.find((provider) => provider.id === activeProfile.provider)
@@ -555,13 +556,7 @@ export default function SettingsModal() {
         ? nextDraft.activeProfileId
         : (normalizedProfiles[0]?.id ?? fallbackProfile.id),
     })
-    if (isSaasMode()) {
-      const active = normalizedDraft.profiles.find((profile) => profile.id === normalizedDraft.activeProfileId) ?? normalizedDraft.profiles[0]
-      if (active) {
-        void updateSaasProviderProfile(active.id, active).catch((error) => {
-          showToast(`保存服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
-        })
-      }
+    if (saasMode) {
       applyDraftSettings(sanitizeSaasSettings(normalizedDraft))
       return
     }
@@ -775,19 +770,9 @@ export default function SettingsModal() {
   const createNewProfile = async () => {
     setReusedTaskApiProfile(null)
     const profile = createDefaultOpenAIProfile({ id: newId('openai'), name: '新配置' })
-    if (isSaasMode()) {
+    if (saasMode) {
       setShowProfileMenu(false)
-      try {
-        const created = await createSaasProviderProfile(profile)
-        const serverProfile = saasProviderProfileToApiProfile(created.providerProfile)
-        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
-          ...draft,
-          profiles: [...draft.profiles, serverProfile],
-          activeProfileId: serverProfile.id,
-        })))
-      } catch (error) {
-        showToast(`创建服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
-      }
+      showToast('渠道由平台管理员在后台配置', 'error')
       return
     }
     const nextDraft = normalizeSettings({ 
@@ -808,19 +793,9 @@ export default function SettingsModal() {
       name: `${activeProfile.name}（复制）`,
       apiKey: '',
     }
-    if (isSaasMode()) {
+    if (saasMode) {
       setShowProfileMenu(false)
-      try {
-        const created = await createSaasProviderProfile(profile)
-        const serverProfile = saasProviderProfileToApiProfile(created.providerProfile)
-        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
-          ...draft,
-          profiles: [...draft.profiles, serverProfile],
-          activeProfileId: serverProfile.id,
-        })))
-      } catch (error) {
-        showToast(`复制服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
-      }
+      showToast('渠道由平台管理员在后台配置', 'error')
       return
     }
     const nextDraft = normalizeSettings({
@@ -978,20 +953,9 @@ export default function SettingsModal() {
 
   const deleteProfile = async (id: string) => {
     if (draft.profiles.length <= 1) return
-    if (isSaasMode()) {
-      try {
-        await deleteSaasProviderProfile(id)
-        if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
-        const nextProfiles = draft.profiles.filter((item) => item.id !== id)
-        applyDraftSettings(sanitizeSaasSettings(normalizeSettings({
-          ...draft,
-          profiles: nextProfiles,
-          activeProfileId: draft.activeProfileId === id ? nextProfiles[0].id : draft.activeProfileId,
-        })))
-        showToast('配置已删除', 'success')
-      } catch (error) {
-        showToast(`删除服务端 API 配置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
-      }
+    if (saasMode) {
+      setShowProfileMenu(false)
+      showToast('渠道由平台管理员在后台配置', 'error')
       return
     }
     if (id === reusedTaskApiProfileId) setReusedTaskApiProfile(null)
@@ -1225,7 +1189,7 @@ export default function SettingsModal() {
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
                 </svg>
-                API 配置
+                {saasMode ? '渠道' : 'API 配置'}
               </button>
               <button
                 onClick={() => setActiveTab('general')}
@@ -1506,7 +1470,7 @@ export default function SettingsModal() {
                 <div>
                   <div className="mb-1.5 flex items-center gap-1.5">
                     <span className="block text-sm text-gray-600 dark:text-gray-300">当前配置</span>
-                    <span className="relative inline-flex">
+                    {!saasMode && <span className="relative inline-flex">
                       <button
                         type="button"
                         onClick={() => confirmCopyProfileImportUrl(activeProfile)}
@@ -1531,8 +1495,8 @@ export default function SettingsModal() {
                       <ViewportTooltip visible={profileImportUrlTooltipVisible} className="whitespace-nowrap">
                         复制导入 URL
                       </ViewportTooltip>
-                    </span>
-                    <span className="relative inline-flex">
+                    </span>}
+                    {!saasMode && <span className="relative inline-flex">
                       <button
                         type="button"
                         onClick={() => { void duplicateActiveProfile() }}
@@ -1557,7 +1521,7 @@ export default function SettingsModal() {
                       <ViewportTooltip visible={duplicateProfileTooltipVisible} className="whitespace-nowrap">
                         复制当前配置
                       </ViewportTooltip>
-                    </span>
+                    </span>}
                   </div>
                   <div ref={profileMenuRef} className="relative">
                     <button
@@ -1585,7 +1549,7 @@ export default function SettingsModal() {
                           className="absolute right-0 top-full z-50 mt-1.5 w-full overflow-hidden overflow-y-auto rounded-xl border border-gray-200/60 bg-white/95 py-1 shadow-[0_8px_30px_rgb(0,0,0,0.12)] ring-1 ring-black/5 backdrop-blur-xl animate-dropdown-down dark:border-white/[0.08] dark:bg-gray-900/95 dark:shadow-[0_8px_30px_rgb(0,0,0,0.3)] dark:ring-white/10 custom-scrollbar"
                           style={{ maxHeight: profileMenuMaxHeight }}
                         >
-                          <button
+                          {!saasMode && <button
                             type="button"
                             onClick={(e) => {
                               e.preventDefault()
@@ -1597,22 +1561,22 @@ export default function SettingsModal() {
                             <span className="flex h-5 w-5 shrink-0 items-center justify-center">
                               <PlusIcon className="h-4 w-4" />
                             </span>
-                          </button>
+                          </button>}
                           <div>
                             {draft.profiles.map(profile => (
                               <div
                                 key={profile.id}
                                 data-profile-id={profile.id}
                                 title={profile.name}
-                                draggable
+                                draggable={!saasMode}
                                 onDragStart={(e) => handleProfileDragStart(e, profile.id)}
                                 onDragOver={(e) => handleProfileDragOver(e, profile.id)}
                                 onDrop={(e) => handleProfileDrop(e, profile.id)}
                                 onDragEnd={handleProfileDragEnd}
-                                onTouchStart={(e) => handleProfileTouchStart(e, profile)}
-                                onTouchMove={handleProfileTouchMove}
-                                onTouchEnd={handleProfileTouchEnd}
-                                onTouchCancel={handleProfileDragEnd}
+                                onTouchStart={(e) => { if (!saasMode) handleProfileTouchStart(e, profile) }}
+                                onTouchMove={(e) => { if (!saasMode) handleProfileTouchMove(e) }}
+                                onTouchEnd={(e) => { if (!saasMode) handleProfileTouchEnd(e) }}
+                                onTouchCancel={() => { if (!saasMode) handleProfileDragEnd() }}
                                 onClick={(e) => {
                                   // Don't switch profile if they are clicking the drag handle
                                   if ((e.target as HTMLElement).closest('[data-drag-handle]')) return
@@ -1630,7 +1594,7 @@ export default function SettingsModal() {
                                 <div className="flex min-w-0 flex-1 items-center gap-2 pr-2">
                                   <div
                                     data-drag-handle
-                                    className="flex cursor-grab active:cursor-grabbing items-center justify-center text-gray-400 opacity-60 transition-opacity hover:opacity-100 dark:text-gray-500"
+                                    className={`cursor-grab active:cursor-grabbing items-center justify-center text-gray-400 opacity-60 transition-opacity hover:opacity-100 dark:text-gray-500 ${saasMode ? 'hidden' : 'flex'}`}
                                     style={{ touchAction: 'none' }}
                                     title="拖拽排序"
                                   >
@@ -1642,7 +1606,7 @@ export default function SettingsModal() {
                                   </span>
                                 </div>
                                 
-                                <div className="flex shrink-0 items-center gap-1">
+                                {!saasMode && <div className="flex shrink-0 items-center gap-1">
                                   <button
                                     type="button"
                                     onClick={(e) => {
@@ -1674,7 +1638,7 @@ export default function SettingsModal() {
                                       <TrashIcon className="h-3.5 w-3.5" />
                                     </button>
                                   )}
-                                </div>
+                                </div>}
                               </div>
                             ))}
                           </div>
@@ -1684,6 +1648,18 @@ export default function SettingsModal() {
                   </div>
                 </div>
 
+              {saasMode ? (
+                <div className="rounded-2xl border border-gray-100 bg-gray-50/70 p-4 text-sm text-gray-600 dark:border-white/[0.06] dark:bg-white/[0.03] dark:text-gray-300">
+                  <div className="font-medium text-gray-800 dark:text-gray-100">{activeProfile.name}</div>
+                  <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                    {getApiProviderLabel(draft, activeProfile.provider)} / {activeProfile.model || '-'} / {activeProfile.apiMode === 'responses' ? 'Responses API' : 'Images API'}
+                  </div>
+                  <div className="mt-3 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
+                    渠道参数由平台管理员统一配置，当前账号只保存所选渠道。
+                  </div>
+                </div>
+              ) : (
+                <>
               {/* 1. 配置名称 */}
               <label className="block">
                 <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">配置名称</span>
@@ -1953,6 +1929,8 @@ export default function SettingsModal() {
                     className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
                   />
                 </label>
+              )}
+                </>
               )}
             </div>
             )}

@@ -64,7 +64,7 @@ async function register(app: FastifyInstance, email: string): Promise<{ cookie: 
 async function createResponsesProvider(app: FastifyInstance, cookie: string): Promise<string> {
   const response = await app.inject({
     method: 'POST',
-    url: '/api/provider-profiles',
+    url: '/api/admin/channels',
     headers: { cookie },
     payload: {
       name: 'Agent OpenAI',
@@ -76,7 +76,7 @@ async function createResponsesProvider(app: FastifyInstance, cookie: string): Pr
     },
   })
   expect(response.statusCode).toBe(201)
-  return (response.json() as { providerProfile: { id: string } }).providerProfile.id
+  return (response.json() as { channel: { id: string } }).channel.id
 }
 
 async function uploadTinyImage(app: FastifyInstance, cookie: string): Promise<string> {
@@ -157,7 +157,6 @@ describeWithDb('GitHub OAuth and Agent image references', () => {
     const owner = await register(app, 'owner@example.com')
     const other = await register(app, 'other@example.com')
     const providerProfileId = await createResponsesProvider(app, owner.cookie)
-    const otherProviderProfileId = await createResponsesProvider(app, other.cookie)
     const imageId = await uploadTinyImage(app, owner.cookie)
 
     let upstreamBody: Record<string, unknown> | null = null
@@ -206,7 +205,7 @@ describeWithDb('GitHub OAuth and Agent image references', () => {
       url: '/api/agent/responses',
       headers: { cookie: other.cookie },
       payload: {
-        providerProfileId: otherProviderProfileId,
+        providerProfileId,
         body: {
           model: 'gpt-5.5',
           input: [{ role: 'user', content: [{ type: 'input_image', image_id: imageId }] }],

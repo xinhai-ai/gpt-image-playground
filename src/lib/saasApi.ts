@@ -31,6 +31,7 @@ export interface SaasSession {
     apiMode: string
     config?: unknown
     hasApiKey?: boolean
+    disabledAt?: string | null
   }>
 }
 
@@ -278,26 +279,6 @@ function apiProfilePayload(profile: Partial<ApiProfile>): Record<string, unknown
 
 export function listSaasProviderProfiles(): Promise<{ providerProfiles: SaasProviderProfile[] }> {
   return saasRequest<{ providerProfiles: SaasProviderProfile[] }>('/provider-profiles')
-}
-
-export function createSaasProviderProfile(profile: ApiProfile): Promise<{ providerProfile: SaasProviderProfile }> {
-  return saasRequest<{ providerProfile: SaasProviderProfile }>('/provider-profiles', {
-    method: 'POST',
-    body: JSON.stringify(apiProfilePayload(profile)),
-  })
-}
-
-export function updateSaasProviderProfile(profileId: string, patch: Partial<ApiProfile>): Promise<{ providerProfile: SaasProviderProfile }> {
-  return saasRequest<{ providerProfile: SaasProviderProfile }>(`/provider-profiles/${encodeURIComponent(profileId)}`, {
-    method: 'PATCH',
-    body: JSON.stringify(apiProfilePayload(patch)),
-  })
-}
-
-export function deleteSaasProviderProfile(profileId: string): Promise<{ ok: true }> {
-  return saasRequest<{ ok: true }>(`/provider-profiles/${encodeURIComponent(profileId)}`, {
-    method: 'DELETE',
-  })
 }
 
 async function uploadBlobToSignedUrl(uploadUrl: string, blob: Blob, headers?: Record<string, string>): Promise<void> {
@@ -586,16 +567,29 @@ export interface AdminChannel {
   baseUrl: string
   model: string
   apiMode: string
+  config?: unknown
   hasApiKey: boolean
   disabledAt: string | null
   createdAt: string
   updatedAt: string
   taskCount: number
-  tenant: {
-    id: string
-    name: string
-    slug: string
-  }
+}
+
+export interface AdminChannelInput {
+  name?: string
+  provider?: ApiProfile['provider']
+  baseUrl?: string
+  model?: string
+  apiMode?: ApiProfile['apiMode']
+  apiKey?: string
+  clearApiKey?: boolean
+  disabled?: boolean
+  config?: Record<string, unknown>
+  timeout?: number
+  codexCli?: boolean
+  streamImages?: boolean
+  streamPartialImages?: number
+  responseFormatB64Json?: boolean
 }
 
 export interface AdminStorage {
@@ -659,10 +653,31 @@ export function listAdminChannels(): Promise<{ channels: AdminChannel[] }> {
   return saasRequest('/admin/channels')
 }
 
-export function updateAdminChannel(profileId: string, patch: { disabled: boolean }): Promise<{ channel: SaasProviderProfile }> {
+function adminChannelPayload(input: AdminChannelInput): Record<string, unknown> {
+  const payload = apiProfilePayload(input)
+  if (input.config !== undefined) payload.config = input.config
+  if (input.clearApiKey) payload.clearApiKey = true
+  if (input.disabled !== undefined) payload.disabled = input.disabled
+  return payload
+}
+
+export function createAdminChannel(input: AdminChannelInput): Promise<{ channel: AdminChannel }> {
+  return saasRequest('/admin/channels', {
+    method: 'POST',
+    body: JSON.stringify(adminChannelPayload(input)),
+  })
+}
+
+export function updateAdminChannel(profileId: string, patch: AdminChannelInput): Promise<{ channel: AdminChannel }> {
   return saasRequest(`/admin/channels/${encodeURIComponent(profileId)}`, {
     method: 'PATCH',
-    body: JSON.stringify(patch),
+    body: JSON.stringify(adminChannelPayload(patch)),
+  })
+}
+
+export function deleteAdminChannel(profileId: string): Promise<{ ok: true }> {
+  return saasRequest(`/admin/channels/${encodeURIComponent(profileId)}`, {
+    method: 'DELETE',
   })
 }
 

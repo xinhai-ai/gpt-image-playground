@@ -195,8 +195,12 @@ const adminUserPatchSchema = z.object({
   isPlatformAdmin: z.boolean().optional(),
 })
 
-const adminChannelPatchSchema = z.object({
-  disabled: z.boolean(),
+const adminChannelCreateSchema = providerProfileCreateSchema.extend({
+  disabled: z.boolean().optional(),
+})
+
+const adminChannelPatchSchema = providerProfilePatchSchema.extend({
+  disabled: z.boolean().optional(),
 })
 
 function parseBody<T>(schema: z.ZodSchema<T>, body: unknown): T {
@@ -371,6 +375,13 @@ function serializeProviderProfile(profile: ProviderProfile) {
   }
 }
 
+function serializeAdminChannel(profile: ProviderProfile & { _count?: { tasks: number } }) {
+  return {
+    ...serializeProviderProfile(profile),
+    taskCount: profile._count?.tasks ?? 0,
+  }
+}
+
 function isPlatformAdminUser(user: Pick<User, 'email' | 'isPlatformAdmin'>): boolean {
   return user.isPlatformAdmin || config.adminEmails.includes(normalizeEmail(user.email))
 }
@@ -510,7 +521,7 @@ async function ensureUserTenantAndProvider(userId: string, email: string, tenant
   const normalizedEmail = normalizeEmail(email)
   const existing = await getAuthForUserId(userId)
   if (existing) {
-    await ensureTenantProviderProfile(existing.tenant.id)
+    await ensureGlobalProviderProfile()
     if (!existing.user.isPlatformAdmin && config.adminEmails.includes(normalizedEmail)) {
       await prisma.user.update({
         where: { id: existing.user.id },
@@ -545,11 +556,9 @@ async function ensureUserTenantAndProvider(userId: string, email: string, tenant
         role: TenantRole.OWNER,
       },
     })
-    await tx.providerProfile.create({
-      data: await defaultProviderData(tenant.id),
-    })
   })
 
+  await ensureGlobalProviderProfile()
   return getAuthForUserId(userId)
 }
 
@@ -753,9 +762,9 @@ async function processUploadIntoImage(
   }
 }
 
-async function defaultProviderData(tenantId: string) {
+async function defaultProviderData() {
   return {
-    tenantId,
+    tenantId: null,
     name: config.defaultProvider.name,
     provider: config.defaultProvider.provider,
     baseUrl: config.defaultProvider.baseUrl,
@@ -768,33 +777,37 @@ async function defaultProviderData(tenantId: string) {
   }
 }
 
-async function ensureTenantProviderProfile(tenantId: string): Promise<ProviderProfile> {
+async function ensureGlobalProviderProfile(): Promise<ProviderProfile> {
   const existing = await prisma.providerProfile.findFirst({
-    where: { tenantId },
+    where: { tenantId: null },
     orderBy: { createdAt: 'asc' },
   })
   if (existing) return existing
-  return prisma.providerProfile.create({ data: await defaultProviderData(tenantId) })
+  return prisma.providerProfile.create({ data: await defaultProviderData() })
 }
 
-function listProviderProfiles(tenantId: string): Promise<ProviderProfile[]> {
+async function listProviderProfiles(): Promise<ProviderProfile[]> {
+  await ensureGlobalProviderProfile()
   return prisma.providerProfile.findMany({
-    where: { tenantId },
+    where: {
+      tenantId: null,
+      disabledAt: null,
+    },
     orderBy: { createdAt: 'asc' },
   })
 }
 
-async function getProviderProfileForTask(tenantId: string, providerProfileId?: string | null): Promise<ProviderProfile> {
+async function getProviderProfileForTask(providerProfileId?: string | null): Promise<ProviderProfile> {
   if (providerProfileId) {
     const requested = await prisma.providerProfile.findFirst({
       where: {
         id: providerProfileId,
-        tenantId,
+        tenantId: null,
       },
     })
     if (requested) return requested
   }
-  return ensureTenantProviderProfile(tenantId)
+  return ensureGlobalProviderProfile()
 }
 
 function providerProfileUpdateData(body: z.infer<typeof providerProfilePatchSchema>): Prisma.ProviderProfileUpdateInput {
@@ -1481,7 +1494,7 @@ export async function buildApp() {
       const payload = await parseBetterAuthJson<{ user: BetterAuthUserPayload }>(response)
       const auth = await ensureUserTenantAndProvider(payload.user.id, payload.user.email, body.tenantName)
       if (!auth) return reply.status(500).send({ error: '注册后创建会话失败' })
-      const providerProfiles = await listProviderProfiles(auth.tenant.id)
+      const providerProfiles = await listProviderProfiles()
       await writeUsageLog({
         request,
         auth,
@@ -1521,7 +1534,7 @@ export async function buildApp() {
       const payload = await parseBetterAuthJson<{ user: BetterAuthUserPayload }>(response)
       const auth = await ensureUserTenantAndProvider(payload.user.id, payload.user.email)
       if (!auth) return reply.status(500).send({ error: '登录后创建会话失败' })
-      const providerProfiles = await listProviderProfiles(auth.tenant.id)
+      const providerProfiles = await listProviderProfiles()
       await writeUsageLog({
         request,
         auth,
@@ -1569,7 +1582,7 @@ export async function buildApp() {
   app.get('/api/auth/me', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    const providerProfiles = await listProviderProfiles(auth.tenant.id)
+    const providerProfiles = await listProviderProfiles()
     return publicSession(auth, providerProfiles)
   })
 
@@ -1776,7 +1789,7 @@ export async function buildApp() {
   app.get('/api/tenants/current', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    const providerProfiles = await listProviderProfiles(auth.tenant.id)
+    const providerProfiles = await listProviderProfiles()
     return {
       tenant: publicSession(auth, providerProfiles).tenant,
       providerProfiles: providerProfiles.map(serializeProviderProfile),
@@ -1807,99 +1820,26 @@ export async function buildApp() {
   app.get('/api/provider-profiles', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    const providerProfiles = await listProviderProfiles(auth.tenant.id)
+    const providerProfiles = await listProviderProfiles()
     return { providerProfiles: providerProfiles.map(serializeProviderProfile) }
   })
 
   app.post('/api/provider-profiles', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    try {
-      const body = parseBody(providerProfileCreateSchema, request.body)
-      const profile = await prisma.providerProfile.create({
-        data: {
-          tenantId: auth.tenant.id,
-          name: body.name.trim(),
-          provider: body.provider.trim(),
-          baseUrl: normalizeOutboundHttpUrl(body.baseUrl, 'Provider Base URL'),
-          model: body.model.trim(),
-          apiMode: body.apiMode,
-          apiKeyEncrypted: body.apiKey?.trim() ? encryptSecret(body.apiKey) : null,
-          ...(body.config !== undefined ? { config: body.config as Prisma.InputJsonValue } : {}),
-        },
-      })
-      await writeUsageLog({
-        request,
-        auth,
-        action: 'provider_profile.create',
-        targetType: 'providerProfile',
-        targetId: profile.id,
-        detail: { provider: profile.provider, model: profile.model },
-      })
-      return reply.status(201).send({ providerProfile: serializeProviderProfile(profile) })
-    } catch (error) {
-      if (error instanceof z.ZodError) return sendZodError(reply, error)
-      if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
-      throw error
-    }
+    return reply.status(403).send({ error: '渠道由平台管理员在后台配置' })
   })
 
   app.patch('/api/provider-profiles/:profileId', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    const { profileId } = request.params as { profileId: string }
-    try {
-      const body = parseBody(providerProfilePatchSchema, request.body)
-      const existing = await prisma.providerProfile.findFirst({
-        where: {
-          id: profileId,
-          tenantId: auth.tenant.id,
-        },
-      })
-      if (!existing) return reply.status(404).send({ error: 'Provider 配置不存在' })
-      const profile = await prisma.providerProfile.update({
-        where: { id: existing.id },
-        data: providerProfileUpdateData(body),
-      })
-      await writeUsageLog({
-        request,
-        auth,
-        action: 'provider_profile.update',
-        targetType: 'providerProfile',
-        targetId: profile.id,
-        detail: { provider: profile.provider, model: profile.model },
-      })
-      return { providerProfile: serializeProviderProfile(profile) }
-    } catch (error) {
-      if (error instanceof z.ZodError) return sendZodError(reply, error)
-      if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
-      throw error
-    }
+    return reply.status(403).send({ error: '渠道由平台管理员在后台配置' })
   })
 
   app.delete('/api/provider-profiles/:profileId', async (request, reply) => {
     const auth = await requireAuth(request, reply)
     if (!auth) return
-    const { profileId } = request.params as { profileId: string }
-    const existing = await prisma.providerProfile.findFirst({
-      where: {
-        id: profileId,
-        tenantId: auth.tenant.id,
-      },
-    })
-    if (!existing) return reply.status(404).send({ error: 'Provider 配置不存在' })
-    const count = await prisma.providerProfile.count({ where: { tenantId: auth.tenant.id } })
-    if (count <= 1) return reply.status(400).send({ error: '至少需要保留一个 Provider 配置' })
-    await prisma.providerProfile.delete({ where: { id: existing.id } })
-    await writeUsageLog({
-      request,
-      auth,
-      action: 'provider_profile.delete',
-      targetType: 'providerProfile',
-      targetId: existing.id,
-      detail: { provider: existing.provider, model: existing.model },
-    })
-    return { ok: true }
+    return reply.status(403).send({ error: '渠道由平台管理员在后台配置' })
   })
 
   app.get('/api/admin/overview', async (request, reply) => {
@@ -2174,34 +2114,61 @@ export async function buildApp() {
   app.get('/api/admin/channels', async (request, reply) => {
     const auth = await requirePlatformAdmin(request, reply)
     if (!auth) return
+    await ensureGlobalProviderProfile()
     const profiles = await prisma.providerProfile.findMany({
+      where: { tenantId: null },
       orderBy: { createdAt: 'desc' },
       include: {
-        tenant: true,
         _count: {
           select: { tasks: true },
         },
       },
     })
     return {
-      channels: profiles.map((profile) => ({
-        id: profile.id,
-        name: profile.name,
-        provider: profile.provider,
-        baseUrl: profile.baseUrl,
-        model: profile.model,
-        apiMode: profile.apiMode,
-        hasApiKey: Boolean(profile.apiKeyEncrypted),
-        disabledAt: profile.disabledAt?.toISOString() ?? null,
-        createdAt: profile.createdAt.toISOString(),
-        updatedAt: profile.updatedAt.toISOString(),
-        taskCount: profile._count.tasks,
-        tenant: {
-          id: profile.tenant.id,
-          name: profile.tenant.name,
-          slug: profile.tenant.slug,
+      channels: profiles.map(serializeAdminChannel),
+    }
+  })
+
+  app.post('/api/admin/channels', async (request, reply) => {
+    const auth = await requirePlatformAdmin(request, reply)
+    if (!auth) return
+    try {
+      const body = parseBody(adminChannelCreateSchema, request.body)
+      const profile = await prisma.providerProfile.create({
+        data: {
+          tenantId: null,
+          name: body.name.trim(),
+          provider: body.provider.trim(),
+          baseUrl: normalizeOutboundHttpUrl(body.baseUrl, 'Provider Base URL'),
+          model: body.model.trim(),
+          apiMode: body.apiMode,
+          apiKeyEncrypted: body.apiKey?.trim() ? encryptSecret(body.apiKey) : null,
+          disabledAt: body.disabled ? new Date() : null,
+          ...(body.config !== undefined ? { config: body.config as Prisma.InputJsonValue } : {}),
         },
-      })),
+        include: {
+          _count: {
+            select: { tasks: true },
+          },
+        },
+      })
+      await writeUsageLog({
+        request,
+        auth,
+        action: 'admin.channel.create',
+        targetType: 'providerProfile',
+        targetId: profile.id,
+        detail: {
+          disabled: profile.disabledAt != null,
+          provider: profile.provider,
+          model: profile.model,
+        },
+      })
+      return reply.status(201).send({ channel: serializeAdminChannel(profile) })
+    } catch (error) {
+      if (error instanceof z.ZodError) return sendZodError(reply, error)
+      if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
+      throw error
     }
   })
 
@@ -2211,12 +2178,30 @@ export async function buildApp() {
     const { profileId } = request.params as { profileId: string }
     try {
       const body = parseBody(adminChannelPatchSchema, request.body)
-      const existing = await prisma.providerProfile.findUnique({ where: { id: profileId } })
+      const existing = await prisma.providerProfile.findFirst({
+        where: { id: profileId, tenantId: null },
+      })
       if (!existing) return reply.status(404).send({ error: '渠道不存在' })
+      if (body.disabled && !existing.disabledAt) {
+        const remainingEnabledChannels = await prisma.providerProfile.count({
+          where: {
+            tenantId: null,
+            disabledAt: null,
+            id: { not: existing.id },
+          },
+        })
+        if (remainingEnabledChannels === 0) return reply.status(400).send({ error: '至少需要保留一个启用渠道' })
+      }
       const profile = await prisma.providerProfile.update({
         where: { id: existing.id },
         data: {
-          disabledAt: body.disabled ? (existing.disabledAt ?? new Date()) : null,
+          ...providerProfileUpdateData(body),
+          ...(body.disabled !== undefined ? { disabledAt: body.disabled ? (existing.disabledAt ?? new Date()) : null } : {}),
+        },
+        include: {
+          _count: {
+            select: { tasks: true },
+          },
         },
       })
       await writeUsageLog({
@@ -2231,11 +2216,43 @@ export async function buildApp() {
           model: profile.model,
         },
       })
-      return { channel: serializeProviderProfile(profile) }
+      return { channel: serializeAdminChannel(profile) }
     } catch (error) {
       if (error instanceof z.ZodError) return sendZodError(reply, error)
+      if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
       throw error
     }
+  })
+
+  app.delete('/api/admin/channels/:profileId', async (request, reply) => {
+    const auth = await requirePlatformAdmin(request, reply)
+    if (!auth) return
+    const { profileId } = request.params as { profileId: string }
+    const existing = await prisma.providerProfile.findFirst({
+      where: { id: profileId, tenantId: null },
+      include: {
+        _count: {
+          select: { tasks: true },
+        },
+      },
+    })
+    if (!existing) return reply.status(404).send({ error: '渠道不存在' })
+    const channelCount = await prisma.providerProfile.count({ where: { tenantId: null } })
+    if (channelCount <= 1) return reply.status(400).send({ error: '至少需要保留一个渠道' })
+    if (existing._count.tasks > 0) return reply.status(400).send({ error: '该渠道已有任务引用，请停用而不是删除' })
+    await prisma.providerProfile.delete({ where: { id: existing.id } })
+    await writeUsageLog({
+      request,
+      auth,
+      action: 'admin.channel.delete',
+      targetType: 'providerProfile',
+      targetId: existing.id,
+      detail: {
+        provider: existing.provider,
+        model: existing.model,
+      },
+    })
+    return { ok: true }
   })
 
   app.get('/api/admin/storage', async (request, reply) => {
@@ -2588,7 +2605,7 @@ export async function buildApp() {
     })) return
     try {
       const body = parseBody(createTaskSchema, request.body)
-      const providerProfile = await getProviderProfileForTask(auth.tenant.id, body.providerProfileId)
+      const providerProfile = await getProviderProfileForTask(body.providerProfileId)
       if (providerProfile.disabledAt) {
         return reply.status(400).send({ error: `Provider 配置「${providerProfile.name}」已被后台停用` })
       }
@@ -2786,7 +2803,7 @@ export async function buildApp() {
     })) return
     try {
       const body = parseBody(agentResponsesSchema, request.body)
-      const providerProfile = await getProviderProfileForTask(auth.tenant.id, body.providerProfileId)
+      const providerProfile = await getProviderProfileForTask(body.providerProfileId)
       if (providerProfile.disabledAt) {
         return reply.status(400).send({ error: `Provider 配置「${providerProfile.name}」已被后台停用` })
       }

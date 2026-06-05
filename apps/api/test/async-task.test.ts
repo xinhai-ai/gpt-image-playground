@@ -56,7 +56,7 @@ async function register(app: FastifyInstance): Promise<string> {
 async function createProvider(app: FastifyInstance, cookie: string): Promise<string> {
   const response = await app.inject({
     method: 'POST',
-    url: '/api/provider-profiles',
+    url: '/api/admin/channels',
     headers: { cookie },
     payload: {
       name: 'Async OpenAI',
@@ -68,7 +68,7 @@ async function createProvider(app: FastifyInstance, cookie: string): Promise<str
     },
   })
   expect(response.statusCode).toBe(201)
-  return (response.json() as { providerProfile: { id: string } }).providerProfile.id
+  return (response.json() as { channel: { id: string } }).channel.id
 }
 
 async function waitForTask(app: FastifyInstance, cookie: string, taskId: string): Promise<{

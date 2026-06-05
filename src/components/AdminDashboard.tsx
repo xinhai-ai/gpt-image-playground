@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  createAdminChannel,
+  deleteAdminChannel,
   getAdminOverview,
   getAdminStorage,
   listAdminChannels,
@@ -9,6 +11,7 @@ import {
   updateAdminChannel,
   updateAdminUser,
   type AdminChannel,
+  type AdminChannelInput,
   type AdminOverview,
   type AdminStorage,
   type AdminUsageLog,
@@ -24,10 +27,29 @@ import { EmptyState } from './ui/EmptyState'
 import { Pagination } from './ui/Pagination'
 import { DataTable, type DataTableColumn } from './ui/DataTable'
 import { TextInput } from './ui/TextInput'
-import { ChevronLeftIcon, RefreshIcon } from './icons'
+import { Modal } from './ui/Modal'
+import { ChevronLeftIcon, EditIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
 
 type AdminTab = 'overview' | 'users' | 'logs' | 'channels' | 'storage'
 const ADMIN_PAGE_SIZE = 50
+type ChannelFormMode = 'create' | 'edit'
+
+interface ChannelFormState {
+  id?: string
+  name: string
+  provider: string
+  baseUrl: string
+  model: string
+  apiMode: 'images' | 'responses'
+  apiKey: string
+  clearApiKey: boolean
+  disabled: boolean
+  timeout: string
+  codexCli: boolean
+  streamImages: boolean
+  streamPartialImages: string
+  responseFormatB64Json: boolean
+}
 
 const TABS: Array<[AdminTab, string]> = [
   ['overview', '概览'],
@@ -36,6 +58,48 @@ const TABS: Array<[AdminTab, string]> = [
   ['channels', '渠道'],
   ['storage', '存储'],
 ]
+
+const emptyChannelForm = (): ChannelFormState => ({
+  name: '',
+  provider: 'openai',
+  baseUrl: 'https://api.openai.com/v1',
+  model: 'gpt-image-2',
+  apiMode: 'images',
+  apiKey: '',
+  clearApiKey: false,
+  disabled: false,
+  timeout: '600',
+  codexCli: false,
+  streamImages: false,
+  streamPartialImages: '1',
+  responseFormatB64Json: false,
+})
+
+function channelConfig(channel: AdminChannel): Record<string, unknown> {
+  return channel.config && typeof channel.config === 'object' && !Array.isArray(channel.config)
+    ? channel.config as Record<string, unknown>
+    : {}
+}
+
+function channelToForm(channel: AdminChannel): ChannelFormState {
+  const config = channelConfig(channel)
+  return {
+    id: channel.id,
+    name: channel.name,
+    provider: channel.provider,
+    baseUrl: channel.baseUrl,
+    model: channel.model,
+    apiMode: channel.apiMode === 'responses' ? 'responses' : 'images',
+    apiKey: '',
+    clearApiKey: false,
+    disabled: Boolean(channel.disabledAt),
+    timeout: typeof config.timeout === 'number' && Number.isFinite(config.timeout) ? String(config.timeout) : '600',
+    codexCli: Boolean(config.codexCli),
+    streamImages: Boolean(config.streamImages),
+    streamPartialImages: typeof config.streamPartialImages === 'number' && Number.isFinite(config.streamPartialImages) ? String(config.streamPartialImages) : '1',
+    responseFormatB64Json: Boolean(config.responseFormatB64Json),
+  }
+}
 
 export default function AdminDashboard({ onClose }: { onClose: () => void }) {
   const auth = useSaasAuth()
@@ -55,6 +119,9 @@ export default function AdminDashboard({ onClose }: { onClose: () => void }) {
   const [logTotal, setLogTotal] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [channelFormMode, setChannelFormMode] = useState<ChannelFormMode>('create')
+  const [channelForm, setChannelForm] = useState<ChannelFormState | null>(null)
+  const [channelSaving, setChannelSaving] = useState(false)
   const loadedTabs = useRef<Set<AdminTab>>(new Set())
 
   const isAdmin = Boolean(auth?.session.user.isPlatformAdmin)
@@ -194,6 +261,79 @@ export default function AdminDashboard({ onClose }: { onClose: () => void }) {
     })
   }
 
+  const openCreateChannel = () => {
+    setChannelFormMode('create')
+    setChannelForm(emptyChannelForm())
+  }
+
+  const openEditChannel = (channel: AdminChannel) => {
+    setChannelFormMode('edit')
+    setChannelForm(channelToForm(channel))
+  }
+
+  const updateChannelForm = (patch: Partial<ChannelFormState>) => {
+    setChannelForm((current) => current ? { ...current, ...patch } : current)
+  }
+
+  const buildChannelPayload = (form: ChannelFormState): AdminChannelInput => {
+    const timeout = Number(form.timeout)
+    const streamPartialImages = Number(form.streamPartialImages)
+    return {
+      name: form.name.trim(),
+      provider: form.provider.trim() || 'openai',
+      baseUrl: form.baseUrl.trim(),
+      model: form.model.trim(),
+      apiMode: form.apiMode,
+      ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
+      clearApiKey: form.clearApiKey,
+      disabled: form.disabled,
+      config: {
+        timeout: Number.isFinite(timeout) ? timeout : 600,
+        codexCli: form.codexCli,
+        streamImages: form.streamImages,
+        streamPartialImages: Number.isFinite(streamPartialImages) ? streamPartialImages : 1,
+        responseFormatB64Json: form.responseFormatB64Json,
+      },
+    }
+  }
+
+  const saveChannel = async () => {
+    if (!channelForm) return
+    if (!channelForm.name.trim() || !channelForm.provider.trim() || !channelForm.model.trim()) {
+      showToast('请填写渠道名称、服务商和模型', 'error')
+      return
+    }
+    setChannelSaving(true)
+    try {
+      const payload = buildChannelPayload(channelForm)
+      if (channelFormMode === 'create') {
+        await createAdminChannel(payload)
+      } else if (channelForm.id) {
+        await updateAdminChannel(channelForm.id, payload)
+      }
+      loadedTabs.current.delete('overview')
+      await loadTab('channels', { silent: true })
+      setChannelForm(null)
+      showToast(channelFormMode === 'create' ? '创建渠道成功' : '保存渠道成功', 'success')
+    } catch (err) {
+      showToast(`保存渠道失败：${err instanceof Error ? err.message : String(err)}`, 'error')
+    } finally {
+      setChannelSaving(false)
+    }
+  }
+
+  const deleteChannel = (channel: AdminChannel) => {
+    confirmAction({
+      title: '删除渠道',
+      message: `确定删除渠道 \`${channel.name}\` 吗？已有任务引用的渠道无法删除，可改为停用。`,
+      confirmText: '删除',
+      tone: 'danger',
+      label: '删除渠道',
+      affectedTab: 'channels',
+      action: () => deleteAdminChannel(channel.id),
+    })
+  }
+
   const searchUsers = () => {
     setUserPage(1)
     void loadTab('users', { userPage: 1 })
@@ -310,10 +450,28 @@ export default function AdminDashboard({ onClose }: { onClose: () => void }) {
           </div>
         )}
 
-        {tab === 'channels' && <ChannelTable channels={channels} onToggleDisabled={toggleChannelDisabled} />}
+        {tab === 'channels' && (
+          <div className="space-y-3">
+            <div className="flex justify-end">
+              <Button onClick={openCreateChannel}>
+                <PlusIcon className="h-4 w-4" />
+                新增渠道
+              </Button>
+            </div>
+            <ChannelTable channels={channels} onToggleDisabled={toggleChannelDisabled} onEdit={openEditChannel} onDelete={deleteChannel} />
+          </div>
+        )}
 
         {tab === 'storage' && storage && <StorageView storage={storage} />}
       </main>
+      <ChannelFormModal
+        form={channelForm}
+        mode={channelFormMode}
+        saving={channelSaving}
+        onChange={updateChannelForm}
+        onClose={() => setChannelForm(null)}
+        onSave={saveChannel}
+      />
     </div>
   )
 }
@@ -403,7 +561,7 @@ function LogTable({ logs }: { logs: AdminUsageLog[] }) {
   return <DataTable columns={columns} rows={logs} rowKey={(log) => log.id} emptyText="暂无日志" />
 }
 
-function ChannelTable({ channels, onToggleDisabled }: { channels: AdminChannel[]; onToggleDisabled: (channel: AdminChannel) => void }) {
+function ChannelTable({ channels, onToggleDisabled, onEdit, onDelete }: { channels: AdminChannel[]; onToggleDisabled: (channel: AdminChannel) => void; onEdit: (channel: AdminChannel) => void; onDelete: (channel: AdminChannel) => void }) {
   const columns: Array<DataTableColumn<AdminChannel>> = [
     {
       key: 'channel',
@@ -419,22 +577,133 @@ function ChannelTable({ channels, onToggleDisabled }: { channels: AdminChannel[]
         </div>
       ),
     },
-    { key: 'tenant', header: '租户', render: (channel) => channel.tenant.name },
+    { key: 'mode', header: '接口', nowrap: true, render: (channel) => channel.apiMode === 'responses' ? 'Responses' : 'Images' },
     { key: 'model', header: '模型', render: (channel) => channel.model },
     { key: 'tasks', header: '任务', render: (channel) => channel.taskCount },
     {
       key: 'actions',
       header: '操作',
       render: (channel) => (
-        <div className="sm:text-right">
+        <div className="flex flex-wrap gap-2 sm:justify-end">
+          <Button tone="secondary" size="sm" onClick={() => onEdit(channel)}>
+            <EditIcon className="h-3.5 w-3.5" />
+            编辑
+          </Button>
           <Button tone="secondary" size="sm" onClick={() => onToggleDisabled(channel)}>
             {channel.disabledAt ? '启用' : '停用'}
+          </Button>
+          <Button tone="secondary" size="sm" disabled={channel.taskCount > 0} onClick={() => onDelete(channel)}>
+            <TrashIcon className="h-3.5 w-3.5" />
+            删除
           </Button>
         </div>
       ),
     },
   ]
   return <DataTable columns={columns} rows={channels} rowKey={(channel) => channel.id} emptyText="暂无渠道" />
+}
+
+function ChannelFormModal({ form, mode, saving, onChange, onClose, onSave }: {
+  form: ChannelFormState | null
+  mode: ChannelFormMode
+  saving: boolean
+  onChange: (patch: Partial<ChannelFormState>) => void
+  onClose: () => void
+  onSave: () => void
+}) {
+  if (!form) return null
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={mode === 'create' ? '新增渠道' : '编辑渠道'}
+      size="lg"
+      footer={(
+        <div className="flex justify-end gap-2">
+          <Button tone="secondary" onClick={onClose} disabled={saving}>取消</Button>
+          <Button onClick={onSave} disabled={saving}>{saving ? '保存中...' : '保存'}</Button>
+        </div>
+      )}
+    >
+      <div className="grid gap-4 md:grid-cols-2">
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">渠道名称</span>
+          <TextInput value={form.name} onChange={(event) => onChange({ name: event.target.value })} />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">服务商</span>
+          <TextInput value={form.provider} onChange={(event) => onChange({ provider: event.target.value })} placeholder="openai" />
+        </label>
+        <label className="block md:col-span-2">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">API Base URL</span>
+          <TextInput value={form.baseUrl} onChange={(event) => onChange({ baseUrl: event.target.value })} placeholder="https://api.openai.com/v1" />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">模型</span>
+          <TextInput value={form.model} onChange={(event) => onChange({ model: event.target.value })} placeholder="gpt-image-2" />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">接口模式</span>
+          <select
+            value={form.apiMode}
+            onChange={(event) => onChange({ apiMode: event.target.value === 'responses' ? 'responses' : 'images' })}
+            className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-500/30 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-100"
+          >
+            <option value="images">Images API</option>
+            <option value="responses">Responses API</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">API Key</span>
+          <TextInput
+            value={form.apiKey}
+            onChange={(event) => onChange({ apiKey: event.target.value, clearApiKey: false })}
+            type="password"
+            placeholder={mode === 'edit' ? '留空则保留原 Key' : 'sk-...'}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">超时秒数</span>
+          <TextInput value={form.timeout} onChange={(event) => onChange({ timeout: event.target.value })} type="number" min={10} max={600} />
+        </label>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2">
+        <ToggleRow label="停用渠道" checked={form.disabled} onChange={(checked) => onChange({ disabled: checked })} />
+        <ToggleRow label="清除 API Key" checked={form.clearApiKey} disabled={mode === 'create'} onChange={(checked) => onChange({ clearApiKey: checked, apiKey: checked ? '' : form.apiKey })} />
+        <ToggleRow label="流式传输" checked={form.streamImages} onChange={(checked) => onChange({ streamImages: checked })} />
+        <ToggleRow label="返回 Base64" checked={form.responseFormatB64Json} onChange={(checked) => onChange({ responseFormatB64Json: checked })} />
+        <ToggleRow label="Codex CLI 兼容" checked={form.codexCli} onChange={(checked) => onChange({ codexCli: checked })} />
+        <label className="block">
+          <span className="mb-1 block text-sm font-medium text-gray-700 dark:text-gray-200">中间步骤图像数</span>
+          <select
+            value={form.streamPartialImages}
+            onChange={(event) => onChange({ streamPartialImages: event.target.value })}
+            className="w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none transition focus:border-blue-400 focus:ring-2 focus:ring-blue-500/30 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-100"
+          >
+            <option value="0">0</option>
+            <option value="1">1</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+          </select>
+        </label>
+      </div>
+    </Modal>
+  )
+}
+
+function ToggleRow({ label, checked, disabled, onChange }: { label: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <label className={`flex items-center justify-between gap-3 rounded-xl border border-gray-100 bg-gray-50/80 px-3 py-2 text-sm dark:border-white/[0.06] dark:bg-white/[0.03] ${disabled ? 'opacity-60' : ''}`}>
+      <span className="text-gray-700 dark:text-gray-200">{label}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+      />
+    </label>
+  )
 }
 
 function StorageView({ storage }: { storage: AdminStorage }) {
@@ -487,8 +756,3 @@ function Breakdown({ title, rows }: { title: string; rows: Array<[string, number
     </Card>
   )
 }
-
-
-
-
-
