@@ -41,7 +41,7 @@ import { prisma } from './prisma.js'
 import { callProvider, type ProviderImageResult, type ProviderProgressEvent, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
 import { assertSafeOutboundUrl, normalizeOutboundHttpUrl } from './security.js'
-import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, deleteImageObjects, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes } from './storage.js'
+import { copyRemoteImageToStorage, createReadUrl, createReadUrlForObject, createUploadUrl, deleteImageObjects, ensureBucket, ensureThumbnailForImage, objectKeyForImage, processAndUploadImage, readObjectBytes, thumbnailObjectKeyForImage } from './storage.js'
 
 const MAX_SERVER_UPLOAD_BYTES = config.image.maxUploadBytes
 const MAX_AGENT_IMAGE_REFERENCES = 32
@@ -69,13 +69,13 @@ type TaskProgressPayload = {
 type TaskUpdateEventPayload = {
   type: 'task.updated'
   phase: TaskEventPhase
-  task: ReturnType<typeof serializeTask>
+  task: SerializedTask
   progress?: TaskProgressPayload
 }
 
 type TaskSnapshotEventPayload = {
   type: 'task.snapshot'
-  tasks: ReturnType<typeof serializeTask>[]
+  tasks: SerializedTask[]
   serverTime: number
 }
 
@@ -121,6 +121,17 @@ type AuthContext = {
 type TaskWithRelations = Task & {
   providerProfile: ProviderProfile | null
   images: Array<TaskImage & { imageAsset: ImageAsset }>
+}
+
+type TaskThumbnailUrl = {
+  url: string
+  expiresAt: string
+  width?: number | null
+  height?: number | null
+}
+
+type SerializedTask = ReturnType<typeof serializeTask> & {
+  thumbnailUrls?: Record<string, TaskThumbnailUrl>
 }
 
 type BetterAuthUserPayload = {
@@ -504,6 +515,72 @@ function serializeTask(task: TaskWithRelations) {
     finishedAt,
     elapsed: finishedAt ? finishedAt - createdAt : null,
   }
+}
+
+async function mapWithConcurrency<T, U>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+  const results = new Array<U>(items.length)
+  let nextIndex = 0
+  const workerCount = Math.min(Math.max(1, concurrency), items.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++
+      results[currentIndex] = await mapper(items[currentIndex]!, currentIndex)
+    }
+  }))
+  return results
+}
+
+function taskThumbnailImageAssets(task: TaskWithRelations): ImageAsset[] {
+  const images = [...task.images].sort((a, b) => a.sortIndex - b.sortIndex)
+  const seen = new Set<string>()
+  const assets: ImageAsset[] = []
+  for (const taskImage of images) {
+    const image = taskImage.imageAsset
+    if (!image || image.status !== ImageStatus.READY || seen.has(image.id)) continue
+    seen.add(image.id)
+    assets.push(image)
+  }
+  return assets
+}
+
+async function createTaskThumbnailUrls(task: TaskWithRelations): Promise<Record<string, TaskThumbnailUrl> | undefined> {
+  const images = taskThumbnailImageAssets(task)
+  if (images.length === 0) return undefined
+
+  const entries = await Promise.all(images.map(async (image): Promise<[string, TaskThumbnailUrl] | null> => {
+    try {
+      const signed = await createReadUrlForObject({
+        bucket: image.bucket,
+        objectKey: thumbnailObjectKeyForImage(image),
+      })
+      return [image.id, {
+        url: signed.readUrl,
+        expiresAt: signed.expiresAt,
+        width: image.width,
+        height: image.height,
+      }]
+    } catch (error) {
+      console.warn(`Failed to create thumbnail URL for image ${image.id}:`, error)
+      return null
+    }
+  }))
+
+  const thumbnailUrls = Object.fromEntries(entries.filter((entry): entry is [string, TaskThumbnailUrl] => Boolean(entry)))
+  return Object.keys(thumbnailUrls).length ? thumbnailUrls : undefined
+}
+
+async function serializeTaskWithThumbnailUrls(task: TaskWithRelations): Promise<SerializedTask> {
+  const serialized: SerializedTask = serializeTask(task)
+  const thumbnailUrls = await createTaskThumbnailUrls(task)
+  return thumbnailUrls ? { ...serialized, thumbnailUrls } : serialized
+}
+
+function serializeTasksWithThumbnailUrls(tasks: TaskWithRelations[]): Promise<SerializedTask[]> {
+  return mapWithConcurrency(tasks, 8, (task) => serializeTaskWithThumbnailUrls(task))
 }
 
 function publicSession(auth: AuthContext, providerProfiles: ProviderProfile[] = []) {
@@ -1388,7 +1465,7 @@ async function publishTaskById(taskId: string, phase: TaskEventPhase, progress?:
   await publishTaskEvent(task.tenantId, {
     type: 'task.updated',
     phase,
-    task: serializeTask(task),
+    task: await serializeTaskWithThumbnailUrls(task),
     ...(progress ? { progress } : {}),
   })
 }
@@ -1419,7 +1496,7 @@ async function latestTaskEventId(tenantId: string): Promise<bigint | null> {
   return event?.id ?? null
 }
 
-async function loadTaskEventSnapshot(tenantId: string): Promise<ReturnType<typeof serializeTask>[]> {
+async function loadTaskEventSnapshot(tenantId: string): Promise<SerializedTask[]> {
   const recentTasks = await prisma.task.findMany({
     where: { tenantId },
     orderBy: { createdAt: 'desc' },
@@ -1447,9 +1524,9 @@ async function loadTaskEventSnapshot(tenantId: string): Promise<ReturnType<typeo
     },
   })
 
-  return [...runningTasks, ...recentTasks]
+  return serializeTasksWithThumbnailUrls([...runningTasks, ...recentTasks]
     .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
-    .map(serializeTask)
+  )
 }
 
 async function replayStoredTaskEvents(input: {
@@ -1651,7 +1728,7 @@ async function markTaskError(taskId: string, error: unknown, rawResponsePayload?
   await publishTaskEvent(failedTask.tenantId, {
     type: 'task.updated',
     phase: 'error',
-    task: serializeTask(failedTask),
+    task: await serializeTaskWithThumbnailUrls(failedTask),
   })
 }
 
@@ -1672,7 +1749,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
       await publishTaskEvent(task.tenantId, {
         type: 'task.updated',
         phase: 'done',
-        task: serializeTask(finished),
+        task: await serializeTaskWithThumbnailUrls(finished),
       })
       return
     }
@@ -1759,7 +1836,7 @@ async function executeTaskInWorker(taskId: string): Promise<void> {
     await publishTaskEvent(task.tenantId, {
       type: 'task.updated',
       phase: 'done',
-      task: serializeTask(finishedTask),
+      task: await serializeTaskWithThumbnailUrls(finishedTask),
     })
   } catch (error) {
     if (isTaskCancelled(taskId) || isPrismaRecordNotFoundError(error)) return
@@ -3191,7 +3268,7 @@ export async function buildApp() {
         },
       },
     })
-    return { tasks: tasks.map(serializeTask) }
+    return { tasks: await serializeTasksWithThumbnailUrls(tasks) }
   })
 
   app.get('/api/tasks/events', async (request, reply) => {
@@ -3274,7 +3351,7 @@ export async function buildApp() {
       },
     })
     if (!task) return reply.status(404).send({ error: '任务不存在' })
-    return { task: serializeTask(task) }
+    return { task: await serializeTaskWithThumbnailUrls(task) }
   })
 
   app.delete('/api/tasks/:taskId', async (request, reply) => {
@@ -3379,14 +3456,15 @@ export async function buildApp() {
           hasMask: Boolean(maskImage),
         },
       })
+      const serializedTask = await serializeTaskWithThumbnailUrls(task)
       await publishTaskEvent(auth.tenant.id, {
         type: 'task.updated',
         phase: 'queued',
-        task: serializeTask(task),
+        task: serializedTask,
       })
       enqueueTaskExecution(task.id)
       return reply.status(202).send({
-        task: serializeTask(task),
+        task: serializedTask,
         images: [],
       })
     } catch (error) {
@@ -3437,7 +3515,7 @@ export async function buildApp() {
           byteSize: image.byteSize,
         },
       })
-      return { task: serializeTask(task) }
+      return { task: await serializeTaskWithThumbnailUrls(task) }
     } catch (error) {
       if (error instanceof z.ZodError) return sendZodError(reply, error)
       throw error
@@ -3487,7 +3565,7 @@ export async function buildApp() {
           byteSize: image.byteSize,
         },
       })
-      return { task: serializeTask(task) }
+      return { task: await serializeTaskWithThumbnailUrls(task) }
     } catch (error) {
       await prisma.imageAsset.update({
         where: { id: imageId },

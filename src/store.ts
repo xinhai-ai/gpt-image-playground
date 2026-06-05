@@ -2268,6 +2268,35 @@ function scheduleSaasTaskOutputThumbnails(tasks: Iterable<TaskRecord>, priority:
   scheduleSaasThumbnailFetch(imageIds, priority)
 }
 
+function parseSaasThumbnailExpiresAt(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+function cacheSaasTaskThumbnailUrls(tasks: Iterable<TaskRecord>) {
+  if (!isSaasMode()) return
+  const minFreshUntil = Date.now() + THUMBNAIL_URL_EXPIRY_GRACE_MS
+  for (const task of tasks) {
+    const thumbnailUrls = task.thumbnailUrls
+    if (!thumbnailUrls) continue
+    for (const [imageId, value] of Object.entries(thumbnailUrls)) {
+      if (!imageId || !value?.url) continue
+      const expiresAt = parseSaasThumbnailExpiresAt(value.expiresAt)
+      if (expiresAt && expiresAt <= minFreshUntil) continue
+      const thumbnail = {
+        dataUrl: value.url,
+        width: typeof value.width === 'number' ? value.width : undefined,
+        height: typeof value.height === 'number' ? value.height : undefined,
+        thumbnailVersion: CURRENT_THUMBNAIL_VERSION,
+        expiresAt,
+      }
+      cacheThumbnail(imageId, thumbnail)
+      notifyImageThumbnail(imageId, thumbnail)
+    }
+  }
+}
+
 async function applySaasTaskList(
   remoteTasks: TaskRecord[],
   options: { preserveLocalRunning?: boolean; removeMissing?: boolean } = { preserveLocalRunning: true, removeMissing: true },
@@ -2283,6 +2312,7 @@ async function applySaasTaskList(
     ? currentTasks.filter((task) => shouldPreserveLocalSaasRunningTask(task, remoteTaskIds))
     : []
   const tasks = [...mergedTasks, ...retainedTasks, ...localRunningTasks]
+  cacheSaasTaskThumbnailUrls(tasks)
   useStore.getState().setTasks(tasks)
   persistTasksBestEffort(tasks)
   scheduleSaasTaskOutputThumbnails(tasks)
@@ -2315,6 +2345,7 @@ async function applySaasTaskEvent(event: SaasTaskEvent): Promise<void> {
     progressPhase: event.phase,
     progressMessage: event.progress?.message ?? getSaasTaskProgressMessage(event.phase),
   }, existing)
+  cacheSaasTaskThumbnailUrls([task])
   if (existing) {
     updateTaskInStore(task.id, task)
   } else {
@@ -2685,6 +2716,7 @@ export async function initStore() {
       const localTasksById = new Map(storedTasks.map((task) => [task.id, task]))
       const remoteTasks = (await listSaasTasks()).tasks.map((task) => mergeSaasTaskLocalState(task, localTasksById.get(task.id)))
       lastSaasFullTaskRefreshAt = Date.now()
+      cacheSaasTaskThumbnailUrls(remoteTasks)
       persistTasksBestEffort(remoteTasks)
       scheduleSaasTaskOutputThumbnails(remoteTasks)
       storedTasks = remoteTasks
@@ -4861,6 +4893,7 @@ async function executeSaasTask(taskId: string, task: TaskRecord) {
     })
     const latest = useStore.getState().tasks.find((t) => t.id === taskId)
     if (!latest || latest.status !== 'running') return
+    cacheSaasTaskThumbnailUrls([result.task])
     updateTaskInStore(taskId, {
       ...result.task,
       status: result.task.status,
@@ -4873,6 +4906,7 @@ async function executeSaasTask(taskId: string, task: TaskRecord) {
     startSaasTaskEvents()
   } catch (error) {
     if (error instanceof SaasApiError && error.task) {
+      cacheSaasTaskThumbnailUrls([error.task])
       updateTaskInStore(taskId, {
         ...error.task,
         status: 'error',

@@ -168,6 +168,13 @@ export type TaskProgressPhase =
   | 'done'
   | 'error'
 
+export interface TaskThumbnailUrl {
+  url: string
+  expiresAt?: string
+  width?: number | null
+  height?: number | null
+}
+
 export interface TaskRecord {
   id: string
   prompt: string
@@ -204,6 +211,8 @@ export interface TaskRecord {
   maskImageId?: string | null
   /** 输出图片的 image store id 列表 */
   outputImages: string[]
+  /** 服务端任务响应中附带的缩略图 URL，key 为 image id */
+  thumbnailUrls?: Record<string, TaskThumbnailUrl>
   /** 流式生成的中间步骤图片 id 列表，仅失败时保留供排查/下载 */
   streamPartialImageIds?: string[]
   /** API 返回的原始图片 HTTP URL（非 base64 时记录） */
