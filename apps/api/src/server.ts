@@ -19,7 +19,7 @@ import {
   type TenantMember,
   type User,
 } from '@prisma/client'
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import path from 'node:path'
@@ -37,6 +37,7 @@ import {
 } from './auth.js'
 import { config } from './config.js'
 import { decryptSecret, encryptSecret, hashPassword, normalizeEmail, verifyPassword } from './crypto.js'
+import { closeEmailOtpResources, emailOtpConfigured, emailOtpUnavailableReason, EmailOtpError, sendEmailOtp, verifyEmailOtp } from './emailOtp.js'
 import { prisma } from './prisma.js'
 import { callProvider, type ProviderImageResult, type ProviderProgressEvent, type TaskParams } from './provider.js'
 import { enforceRateLimit } from './rateLimit.js'
@@ -171,6 +172,15 @@ const registerSchema = z.object({
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1).max(200),
+})
+
+const emailOtpSendSchema = z.object({
+  email: z.string().email(),
+})
+
+const emailOtpVerifySchema = z.object({
+  email: z.string().email(),
+  code: z.string().trim().min(4).max(10),
 })
 
 const changePasswordSchema = z.object({
@@ -621,6 +631,31 @@ function clearBetterAuthCookies(reply: FastifyReply): void {
   reply.clearCookie(`${SESSION_COOKIE}_data`, AUTH_COOKIE_CLEAR_OPTIONS)
 }
 
+async function createSessionCookieForUser(request: FastifyRequest, reply: FastifyReply, userId: string): Promise<void> {
+  const token = randomBytes(32).toString('base64url')
+  const expiresAt = new Date(Date.now() + config.sessionTtlSeconds * 1000)
+  await prisma.session.create({
+    data: {
+      userId,
+      token,
+      expiresAt,
+      lastSeenAt: new Date(),
+      ip: request.ip,
+      ipAddress: request.ip,
+      userAgent: requestUserAgent(request),
+    },
+  })
+  reply.setCookie(SESSION_COOKIE, token, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.cookieSecure,
+    expires: expiresAt,
+    maxAge: config.sessionTtlSeconds,
+  })
+  reply.clearCookie(`${SESSION_COOKIE}_data`, AUTH_COOKIE_CLEAR_OPTIONS)
+}
+
 function requestUserAgent(request: FastifyRequest): string | null {
   const userAgent = request.headers['user-agent']
   if (Array.isArray(userAgent)) return userAgent.join(', ')
@@ -668,6 +703,27 @@ async function getAuthForUserId(userId: string): Promise<AuthContext | null> {
     user,
     tenant: membership.tenant,
     membership,
+  }
+}
+
+async function findOrCreatePasswordlessUser(email: string): Promise<{ user: User; created: boolean }> {
+  const normalizedEmail = normalizeEmail(email)
+  const existing = await prisma.user.findUnique({ where: { email: normalizedEmail } })
+  if (existing) return { user: existing, created: false }
+
+  try {
+    const user = await prisma.user.create({
+      data: {
+        email: normalizedEmail,
+        emailVerified: true,
+        name: tenantNameForEmail(normalizedEmail).replace(/\s+Workspace$/, ''),
+      },
+    })
+    return { user, created: true }
+  } catch (error) {
+    if (!isPrismaUniqueConstraintError(error)) throw error
+    const user = await prisma.user.findUniqueOrThrow({ where: { email: normalizedEmail } })
+    return { user, created: false }
   }
 }
 
@@ -1053,6 +1109,10 @@ function errorMessage(error: unknown): string {
 
 function isPrismaRecordNotFoundError(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025'
+}
+
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
 }
 
 function isProviderBaseUrlInputError(error: unknown): boolean {
@@ -1967,6 +2027,7 @@ export async function buildApp() {
 
   app.addHook('onClose', async () => {
     stopTaskWorker()
+    await closeEmailOtpResources()
   })
 
   // 全局错误处理：统一为 { error, detail? } 结构，避免泄漏 Fastify 默认的
@@ -2085,6 +2146,75 @@ export async function buildApp() {
           403: '账号已被禁用',
         })
       }
+      if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
+      throw error
+    }
+  })
+
+  app.post('/api/auth/email-code/send', async (request, reply) => {
+    try {
+      const body = parseBody(emailOtpSendSchema, request.body)
+      const email = normalizeEmail(body.email)
+      if (!emailOtpConfigured()) return reply.status(503).send({ error: emailOtpUnavailableReason() })
+      if (!await enforceRateLimit(request, reply, {
+        bucket: 'auth.email_code.send',
+        keyParts: [request.ip, email],
+        max: 5,
+        windowMs: 10 * 60_000,
+      })) return
+
+      const result = await sendEmailOtp(email)
+      await writeUsageLog({
+        request,
+        userId: null,
+        tenantId: null,
+        action: 'auth.email_code.send',
+        targetType: 'auth',
+        detail: { emailDomain: email.split('@')[1] ?? '' },
+      })
+      return { ok: true, ...result }
+    } catch (error) {
+      if (error instanceof z.ZodError) return sendZodError(reply, error)
+      if (error instanceof EmailOtpError) return reply.status(error.status).send({ error: error.message })
+      throw error
+    }
+  })
+
+  app.post('/api/auth/email-code/verify', async (request, reply) => {
+    try {
+      const body = parseBody(emailOtpVerifySchema, request.body)
+      const email = normalizeEmail(body.email)
+      if (!emailOtpConfigured()) return reply.status(503).send({ error: emailOtpUnavailableReason() })
+      if (!await enforceRateLimit(request, reply, {
+        bucket: 'auth.email_code.verify',
+        keyParts: [request.ip, email],
+        max: 10,
+        windowMs: 10 * 60_000,
+      })) return
+
+      const verification = await verifyEmailOtp(email, body.code)
+      if (!verification.ok) return reply.status(verification.status).send({ error: verification.error })
+
+      const { user, created } = await findOrCreatePasswordlessUser(verification.email)
+      if (user.disabledAt) return reply.status(403).send({ error: '账号已被禁用' })
+
+      const auth = await ensureUserTenantAndProvider(user.id, user.email)
+      if (!auth) return reply.status(500).send({ error: '验证码登录后创建会话失败' })
+      if (auth.user.disabledAt) return reply.status(403).send({ error: '账号已被禁用' })
+
+      await createSessionCookieForUser(request, reply, auth.user.id)
+      const providerProfiles = await listProviderProfiles()
+      await writeUsageLog({
+        request,
+        auth,
+        action: created ? 'auth.email_code.register' : 'auth.email_code.login',
+        targetType: 'user',
+        targetId: auth.user.id,
+      })
+      return publicSession(auth, providerProfiles)
+    } catch (error) {
+      if (error instanceof z.ZodError) return sendZodError(reply, error)
+      if (error instanceof EmailOtpError) return reply.status(error.status).send({ error: error.message })
       if (isProviderBaseUrlInputError(error)) return reply.status(400).send({ error: errorMessage(error) })
       throw error
     }
@@ -2339,6 +2469,11 @@ export async function buildApp() {
   app.get('/api/auth/oauth-options', async () => ({
     emailPassword: {
       registrationEnabled: config.auth.emailPasswordRegistrationEnabled,
+    },
+    emailOtp: {
+      enabled: emailOtpConfigured(),
+      unavailableReason: emailOtpConfigured() ? null : emailOtpUnavailableReason(),
+      codeLength: Math.max(4, Math.min(10, config.auth.emailOtpCodeLength)),
     },
     github: {
       enabled: githubOAuthEnabled(),

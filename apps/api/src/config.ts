@@ -16,6 +16,8 @@ function readBoolean(name: string, fallback = false): boolean {
   return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase())
 }
 
+const smtpPort = readNumber('SMTP_PORT', 587)
+
 export const config = {
   host: readEnv('HOST', '0.0.0.0'),
   port: readNumber('PORT', 3001),
@@ -38,6 +40,25 @@ export const config = {
     get emailPasswordRegistrationEnabled() {
       return readBoolean('EMAIL_PASSWORD_REGISTRATION_ENABLED', true)
     },
+    get emailOtpEnabled() {
+      return readBoolean('EMAIL_OTP_ENABLED', true)
+    },
+    emailOtpCodeLength: readNumber('EMAIL_OTP_CODE_LENGTH', 6),
+    emailOtpTtlSeconds: readNumber('EMAIL_OTP_TTL_SECONDS', 10 * 60),
+    emailOtpCooldownSeconds: readNumber('EMAIL_OTP_COOLDOWN_SECONDS', 60),
+    emailOtpMaxAttempts: readNumber('EMAIL_OTP_MAX_ATTEMPTS', 5),
+  },
+  redis: {
+    url: readEnv('REDIS_URL'),
+  },
+  smtp: {
+    host: readEnv('SMTP_HOST'),
+    port: smtpPort,
+    secure: readBoolean('SMTP_SECURE', smtpPort === 465),
+    user: readEnv('SMTP_USER'),
+    pass: readEnv('SMTP_PASS'),
+    from: readEnv('SMTP_FROM', readEnv('SMTP_USER')),
+    fromName: readEnv('SMTP_FROM_NAME', 'GPT Image Playground'),
   },
   security: {
     allowPrivateProviderUrls: readBoolean('ALLOW_PRIVATE_PROVIDER_URLS', false),

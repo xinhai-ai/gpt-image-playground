@@ -1,5 +1,5 @@
 import { createContext, type ReactNode, useContext, useEffect, useRef, useState } from 'react'
-import { getCurrentSession, getGitHubOAuthStartUrl, getGoogleOAuthStartUrl, getOAuthOptions, isSaasMode, login, logout, register, saasProviderProfileToApiProfile, type OAuthOptions, type SaasSession } from '../lib/saasApi'
+import { getCurrentSession, getGitHubOAuthStartUrl, getGoogleOAuthStartUrl, getOAuthOptions, isSaasMode, login, logout, register, saasProviderProfileToApiProfile, sendEmailLoginCode, verifyEmailLoginCode, type OAuthOptions, type SaasSession } from '../lib/saasApi'
 import { useStore } from '../store'
 import { Button } from './ui/Button'
 import { TextInput } from './ui/TextInput'
@@ -20,15 +20,27 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   const [session, setSession] = useState<SaasSession | null>(null)
   const [loading, setLoading] = useState(isSaasMode())
   const [mode, setMode] = useState<'login' | 'register'>('login')
+  const [authMethod, setAuthMethod] = useState<'email-code' | 'password'>('email-code')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [emailCodeSent, setEmailCodeSent] = useState(false)
+  const [emailCodeExpiresAt, setEmailCodeExpiresAt] = useState<number | null>(null)
+  const [emailCodeCooldownUntil, setEmailCodeCooldownUntil] = useState<number | null>(null)
+  const [now, setNow] = useState(Date.now())
   const [tenantName, setTenantName] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [oauthOptions, setOauthOptions] = useState<OAuthOptions | null>(null)
   const readySessionId = useRef<string | null>(null)
   const emailPasswordRegistrationEnabled = oauthOptions?.emailPassword?.registrationEnabled !== false
-  const registerMode = mode === 'register' && emailPasswordRegistrationEnabled
+  const emailOtpEnabled = oauthOptions?.emailOtp?.enabled === true
+  const emailCodeMode = emailOtpEnabled && authMethod === 'email-code'
+  const registerMode = authMethod === 'password' && mode === 'register' && emailPasswordRegistrationEnabled
+  const emailCodeCooldownSeconds = emailCodeCooldownUntil ? Math.max(0, Math.ceil((emailCodeCooldownUntil - now) / 1000)) : 0
+  const emailCodeExpiresInSeconds = emailCodeExpiresAt ? Math.max(0, Math.ceil((emailCodeExpiresAt - now) / 1000)) : 0
+  const emailCodeLength = Math.max(4, Math.min(10, oauthOptions?.emailOtp?.codeLength ?? 6))
 
   const applySession = (nextSession: SaasSession) => {
     const profiles = nextSession.providerProfiles.map(saasProviderProfileToApiProfile)
@@ -54,7 +66,7 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
           if (!cancelled) setOauthOptions(options)
         })
         .catch(() => {
-          if (!cancelled) setOauthOptions({ emailPassword: { registrationEnabled: true }, github: { enabled: false }, google: { enabled: false } })
+          if (!cancelled) setOauthOptions({ emailPassword: { registrationEnabled: true }, emailOtp: { enabled: false }, github: { enabled: false }, google: { enabled: false } })
         }),
       getCurrentSession()
         .then((nextSession) => {
@@ -77,6 +89,24 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   }, [emailPasswordRegistrationEnabled, mode])
 
   useEffect(() => {
+    if (oauthOptions && !emailOtpEnabled && authMethod === 'email-code') setAuthMethod('password')
+  }, [authMethod, emailOtpEnabled, oauthOptions])
+
+  useEffect(() => {
+    if (!emailCodeSent && !emailCodeCooldownUntil) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [emailCodeCooldownUntil, emailCodeSent])
+
+  useEffect(() => {
+    setEmailCodeSent(false)
+    setEmailCode('')
+    setEmailCodeExpiresAt(null)
+    setEmailCodeCooldownUntil(null)
+    setNotice('')
+  }, [email])
+
+  useEffect(() => {
     if (!session || readySessionId.current === session.user.id) return
     readySessionId.current = session.user.id
     onReady()
@@ -87,6 +117,23 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
     setError('')
+    setNotice('')
+    if (emailCodeMode) {
+      if (!emailCodeSent) {
+        await handleSendEmailCode()
+        return
+      }
+      setSubmitting(true)
+      try {
+        const nextSession = await verifyEmailLoginCode(email, emailCode)
+        applySession(nextSession)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setSubmitting(false)
+      }
+      return
+    }
     if (mode === 'register' && !emailPasswordRegistrationEnabled) {
       setError('邮箱密码注册已关闭')
       return
@@ -97,6 +144,26 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
         ? await register(email, password, tenantName || undefined)
         : await login(email, password)
       applySession(nextSession)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleSendEmailCode = async () => {
+    setError('')
+    setNotice('')
+    setSubmitting(true)
+    try {
+      const result = await sendEmailLoginCode(email)
+      const nextNow = Date.now()
+      setNow(nextNow)
+      setEmailCode('')
+      setEmailCodeSent(true)
+      setEmailCodeExpiresAt(nextNow + result.expiresIn * 1000)
+      setEmailCodeCooldownUntil(nextNow + result.cooldownSeconds * 1000)
+      setNotice('验证码已发送，请查看邮箱')
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -145,7 +212,25 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
             <h1 className="text-lg font-bold tracking-tight">GPT Image Playground</h1>
             <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">登录后进入画廊</p>
           </div>
-          {emailPasswordRegistrationEnabled && (
+          {emailOtpEnabled && (
+            <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-gray-100/70 p-1 dark:border-white/[0.08] dark:bg-white/[0.04]">
+              <button
+                type="button"
+                onClick={() => setAuthMethod('email-code')}
+                className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${authMethod === 'email-code' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                验证码
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthMethod('password')}
+                className={`rounded-lg px-3 py-1.5 text-sm transition-colors ${authMethod === 'password' ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-white/10 dark:text-white' : 'text-gray-500 hover:text-gray-800 dark:hover:text-gray-200'}`}
+              >
+                密码
+              </button>
+            </div>
+          )}
+          {authMethod === 'password' && emailPasswordRegistrationEnabled && (
             <div className="mb-4 grid grid-cols-2 gap-1 rounded-xl border border-gray-200 bg-gray-100/70 p-1 dark:border-white/[0.08] dark:bg-white/[0.04]">
               <button
                 type="button"
@@ -208,17 +293,48 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
               required
             />
           </label>
-          <label className="mb-3 block">
-            <span className="mb-1 block text-sm font-medium">密码</span>
-            <TextInput
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              autoComplete={registerMode ? 'new-password' : 'current-password'}
-              minLength={registerMode ? 8 : undefined}
-              required
-            />
-          </label>
+          {emailCodeMode ? (
+            emailCodeSent && (
+              <label className="mb-3 block">
+                <span className="mb-1 flex items-center justify-between gap-3 text-sm font-medium">
+                  <span>验证码</span>
+                  <button
+                    type="button"
+                    onClick={handleSendEmailCode}
+                    disabled={submitting || emailCodeCooldownSeconds > 0}
+                    className="text-xs font-medium text-blue-500 disabled:text-gray-400 dark:text-blue-400"
+                  >
+                    {emailCodeCooldownSeconds > 0 ? `${emailCodeCooldownSeconds}s` : '重新发送'}
+                  </button>
+                </span>
+                <TextInput
+                  type="text"
+                  inputMode="numeric"
+                  value={emailCode}
+                  onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, '').slice(0, emailCodeLength))}
+                  autoComplete="one-time-code"
+                  minLength={emailCodeLength}
+                  maxLength={emailCodeLength}
+                  required
+                />
+                {emailCodeExpiresInSeconds > 0 && (
+                  <span className="mt-1 block text-xs text-gray-400">验证码 {emailCodeExpiresInSeconds}s 内有效</span>
+                )}
+              </label>
+            )
+          ) : (
+            <label className="mb-3 block">
+              <span className="mb-1 block text-sm font-medium">密码</span>
+              <TextInput
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete={registerMode ? 'new-password' : 'current-password'}
+                minLength={registerMode ? 8 : undefined}
+                required
+              />
+            </label>
+          )}
           {registerMode && (
             <label className="mb-3 block">
               <span className="mb-1 block text-sm font-medium">租户名称</span>
@@ -234,8 +350,13 @@ export default function AuthGate({ children, onReady }: { children: ReactNode; o
               {error}
             </div>
           )}
+          {notice && (
+            <div className="mb-3 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-700 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300">
+              {notice}
+            </div>
+          )}
           <Button type="submit" disabled={submitting} className="w-full">
-            {submitting ? '提交中...' : registerMode ? '注册并进入' : '登录'}
+            {submitting ? '提交中...' : emailCodeMode ? emailCodeSent ? '登录或注册' : '发送验证码' : registerMode ? '注册并进入' : '登录'}
           </Button>
         </form>
       </div>

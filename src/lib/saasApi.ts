@@ -181,6 +181,20 @@ export function login(email: string, password: string): Promise<SaasSession> {
   })
 }
 
+export function sendEmailLoginCode(email: string): Promise<{ ok: true; expiresIn: number; cooldownSeconds: number }> {
+  return saasRequest('/auth/email-code/send', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  })
+}
+
+export function verifyEmailLoginCode(email: string, code: string): Promise<SaasSession> {
+  return saasRequest<SaasSession>('/auth/email-code/verify', {
+    method: 'POST',
+    body: JSON.stringify({ email, code }),
+  })
+}
+
 export function logout(): Promise<{ ok: true }> {
   return saasRequest<{ ok: true }>('/auth/logout', { method: 'POST' })
 }
@@ -264,6 +278,11 @@ export function updateSaasClientPreferences(preferences: SaasClientPreferences):
 export interface OAuthOptions {
   emailPassword?: {
     registrationEnabled: boolean
+  }
+  emailOtp?: {
+    enabled: boolean
+    unavailableReason?: string | null
+    codeLength?: number
   }
   github?: {
     enabled: boolean
