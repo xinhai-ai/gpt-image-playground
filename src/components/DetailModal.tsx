@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
-import { useStore, getCachedImage, ensureImageCached, reuseConfig, editOutputs, removeTask, showCodexCliPrompt, getCodexCliPromptKey, retryTask } from '../store'
+import { useStore, ensureImageThumbnailCached, subscribeImageThumbnail, reuseConfig, editOutputs, removeTask, showCodexCliPrompt, getCodexCliPromptKey, retryTask } from '../store'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { useTooltip } from '../hooks/useTooltip'
@@ -109,7 +109,7 @@ export default function DetailModal() {
     return () => window.clearInterval(id)
   }, [task?.customRecoverable, task?.falRecoverable, task?.status])
 
-  // 加载所有相关图片
+  // 加载所有相关图片的缩略图；原图只在下载时读取。
   useEffect(() => {
     if (!task) {
       setImageSrcs({})
@@ -120,25 +120,35 @@ export default function DetailModal() {
     }
 
     let cancelled = false
+    const unsubscribes: Array<() => void> = []
     const ids = [...new Set([
       ...(task.inputImageIds || []),
       ...(task.maskImageId ? [task.maskImageId] : []),
     ])]
-    const initial: Record<string, string> = {}
+
+    setImageSrcs((prev) => {
+      const next: Record<string, string> = {}
+      for (const id of ids) {
+        if (prev[id]) next[id] = prev[id]
+      }
+      return next
+    })
+
     for (const id of ids) {
-      const cached = getCachedImage(id)
-      if (cached) initial[id] = cached
-    }
-    setImageSrcs(initial)
-    for (const id of ids) {
-      if (initial[id]) continue
-      ensureImageCached(id).then((url) => {
-        if (!cancelled && url) setImageSrcs((prev) => ({ ...prev, [id]: url }))
-      })
+      const applyThumbnail = (thumbnail: { dataUrl: string }) => {
+        if (!cancelled) setImageSrcs((prev) => ({ ...prev, [id]: thumbnail.dataUrl }))
+      }
+      unsubscribes.push(subscribeImageThumbnail(id, applyThumbnail))
+      ensureImageThumbnailCached(id)
+        .then((thumbnail) => {
+          if (thumbnail) applyThumbnail(thumbnail)
+        })
+        .catch(() => {})
     }
 
     return () => {
       cancelled = true
+      unsubscribes.forEach((unsubscribe) => unsubscribe())
     }
   }, [task])
 
@@ -153,29 +163,66 @@ export default function DetailModal() {
     const outputImageIds = task?.outputImages ?? []
     if (outputImageIds.length === 0) {
       setOutputPreviewSrcs({})
+      setImageRatios({})
+      setImageSizes({})
       return
     }
 
     let cancelled = false
-    const setOutputImage = (imageId: string, dataUrl: string) => {
-      if (!cancelled) setOutputPreviewSrcs((prev) => ({ ...prev, [imageId]: dataUrl }))
+    const unsubscribes: Array<() => void> = []
+    const outputImageIdSet = new Set(outputImageIds)
+
+    setOutputPreviewSrcs((prev) => {
+      const next: Record<string, string> = {}
+      for (const imageId of outputImageIds) {
+        if (prev[imageId]) next[imageId] = prev[imageId]
+      }
+      return next
+    })
+    setImageRatios((prev) => {
+      const next: Record<string, string> = {}
+      for (const imageId of outputImageIds) {
+        if (prev[imageId]) next[imageId] = prev[imageId]
+      }
+      return next
+    })
+    setImageSizes((prev) => {
+      const next: Record<string, string> = {}
+      for (const imageId of outputImageIds) {
+        if (prev[imageId]) next[imageId] = prev[imageId]
+      }
+      return next
+    })
+
+    const setOutputImage = (imageId: string, thumbnail: { dataUrl: string; width?: number; height?: number }) => {
+      if (cancelled || !outputImageIdSet.has(imageId)) return
+      setOutputPreviewSrcs((prev) => ({ ...prev, [imageId]: thumbnail.dataUrl }))
+      const width = thumbnail.width
+      const height = thumbnail.height
+      if (width && height) {
+        setImageRatios((prev) => ({
+          ...prev,
+          [imageId]: formatImageRatio(width, height),
+        }))
+        setImageSizes((prev) => ({
+          ...prev,
+          [imageId]: `${width}×${height}`,
+        }))
+      }
     }
 
     for (const imageId of outputImageIds) {
-      const cached = getCachedImage(imageId)
-      if (cached) {
-        setOutputImage(imageId, cached)
-      } else {
-        ensureImageCached(imageId)
-          .then((dataUrl) => {
-            if (dataUrl) setOutputImage(imageId, dataUrl)
-          })
-          .catch(() => {})
-      }
+      unsubscribes.push(subscribeImageThumbnail(imageId, (thumbnail) => setOutputImage(imageId, thumbnail)))
+      ensureImageThumbnailCached(imageId)
+        .then((thumbnail) => {
+          if (thumbnail) setOutputImage(imageId, thumbnail)
+        })
+        .catch(() => {})
     }
 
     return () => {
       cancelled = true
+      unsubscribes.forEach((unsubscribe) => unsubscribe())
     }
   }, [task?.outputImages])
 
@@ -457,11 +504,11 @@ export default function DetailModal() {
                 onLoad={(e) => {
                   const image = e.currentTarget
                   if (currentOutputImageId && image.naturalWidth > 0 && image.naturalHeight > 0) {
-                    setImageRatios((prev) => ({
+                    setImageRatios((prev) => prev[currentOutputImageId] ? prev : ({
                       ...prev,
                       [currentOutputImageId]: formatImageRatio(image.naturalWidth, image.naturalHeight),
                     }))
-                    setImageSizes((prev) => ({
+                    setImageSizes((prev) => prev[currentOutputImageId] ? prev : ({
                       ...prev,
                       [currentOutputImageId]: `${image.naturalWidth}×${image.naturalHeight}`,
                     }))

@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { useStore, getCachedImage, ensureImageCached } from '../store'
+import { useStore, ensureImageThumbnailCached, subscribeImageThumbnail } from '../store'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { createMaskPreviewDataUrl } from '../lib/canvasImage'
@@ -33,9 +33,10 @@ export default function Lightbox() {
   useCloseOnEscape(Boolean(lightboxImageId), close)
   usePreventBackgroundScroll(Boolean(lightboxImageId))
 
-  // 图片加载
+  // 图片预览使用缩略图；原图只在下载动作中读取。
   useEffect(() => {
     let cancelled = false
+    let unsubscribe: (() => void) | undefined
 
     if (!lightboxImageId) {
       setSrc('')
@@ -45,23 +46,24 @@ export default function Lightbox() {
     setSrc('')
 
     const imageId = lightboxImageId
-    const cached = getCachedImage(imageId)
-    if (cached) {
-      setSrc(cached)
-    } else {
-      ensureImageCached(imageId).then((url) => {
-        if (!cancelled && url) setSrc(url)
-      })
+    const applyThumbnail = (thumbnail: { dataUrl: string }) => {
+      if (!cancelled) setSrc(thumbnail.dataUrl)
     }
+    unsubscribe = subscribeImageThumbnail(imageId, applyThumbnail)
+    ensureImageThumbnailCached(imageId).then((thumbnail) => {
+      if (thumbnail) applyThumbnail(thumbnail)
+    }).catch(() => {})
 
     return () => {
       cancelled = true
+      unsubscribe?.()
     }
   }, [lightboxImageId])
 
-  // 遮罩图加载
+  // 遮罩图预览同样使用缩略图，避免打开任务时下载原图。
   useEffect(() => {
     let cancelled = false
+    let unsubscribe: (() => void) | undefined
 
     if (!lightboxImageId) {
       setMaskImageSrc('')
@@ -78,20 +80,20 @@ export default function Lightbox() {
     const taskWithMask = tasks.find((t) => t.maskTargetImageId === lightboxImageId && t.maskImageId)
     if (taskWithMask?.maskImageId) {
       const maskImageId = taskWithMask.maskImageId
-      const cached = getCachedImage(maskImageId)
-      if (cached) {
-        setMaskImageSrc(cached)
-      } else {
-        ensureImageCached(maskImageId).then((url) => {
-          if (!cancelled && url) setMaskImageSrc(url)
-        })
+      const applyThumbnail = (thumbnail: { dataUrl: string }) => {
+        if (!cancelled) setMaskImageSrc(thumbnail.dataUrl)
       }
+      unsubscribe = subscribeImageThumbnail(maskImageId, applyThumbnail)
+      ensureImageThumbnailCached(maskImageId).then((thumbnail) => {
+        if (thumbnail) applyThumbnail(thumbnail)
+      }).catch(() => {})
     } else {
       setMaskImageSrc('')
     }
 
     return () => {
       cancelled = true
+      unsubscribe?.()
     }
   }, [lightboxImageId, maskDraft?.targetImageId, maskDraft?.maskDataUrl, tasks])
 
