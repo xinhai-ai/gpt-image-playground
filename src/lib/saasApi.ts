@@ -1,4 +1,4 @@
-import type { ApiProfile, TaskParams, TaskRecord } from '../types'
+import type { ApiProfile, AppMode, AppSettings, FavoriteCollection, TaskParams, TaskRecord } from '../types'
 import { dataUrlToBlob } from './canvasImage'
 import { readRuntimeEnv } from './runtimeEnv'
 
@@ -65,6 +65,40 @@ export interface SaasImageUploadResponse {
 export interface SaasCreateTaskResponse {
   task: TaskRecord
   images: SaasTaskOutputImage[]
+}
+
+export interface SaasSyncedSettings {
+  activeProfileId?: string
+  clearInputAfterSubmit?: boolean
+  persistInputOnRestart?: boolean
+  reuseTaskApiProfileTemporarily?: boolean
+  alwaysShowRetryButton?: boolean
+  taskCompletionNotification?: boolean
+  enterSubmit?: boolean
+  referenceImageEditAction?: AppSettings['referenceImageEditAction']
+  zipDownloadRoutes?: AppSettings['zipDownloadRoutes']
+  agentScrollToBottomAfterSubmit?: boolean
+  agentMaxToolRounds?: number
+  agentWebSearch?: boolean
+  profileConfig?: Record<string, Partial<Pick<ApiProfile, 'timeout' | 'codexCli' | 'streamImages' | 'streamPartialImages' | 'responseFormatB64Json'>>>
+}
+
+export interface SaasClientPreferences {
+  version: 1
+  settings?: SaasSyncedSettings
+  params?: TaskParams
+  favoriteCollections?: FavoriteCollection[]
+  defaultFavoriteCollectionId?: string | null
+  taskFavorites?: Record<string, string[]>
+  ui?: {
+    appMode?: AppMode
+    agentSidebarCollapsed?: boolean
+    agentAssetTab?: 'references' | 'outputs'
+    agentAssetPanelCollapsed?: boolean
+    dismissedCodexCliPrompts?: string[]
+    supportPromptDismissed?: boolean
+  }
+  updatedAt?: number
 }
 
 export class SaasApiError extends Error {
@@ -218,6 +252,17 @@ export function changeAccountPassword(input: {
 export function revokeOtherSessions(): Promise<{ ok: true; revokedSessions: number }> {
   return saasRequest('/account/sessions/revoke-others', {
     method: 'POST',
+  })
+}
+
+export function getSaasClientPreferences(): Promise<{ preferences: SaasClientPreferences | null; updatedAt: string | null }> {
+  return saasRequest('/preferences/client')
+}
+
+export function updateSaasClientPreferences(preferences: SaasClientPreferences): Promise<{ preferences: SaasClientPreferences; updatedAt: string }> {
+  return saasRequest('/preferences/client', {
+    method: 'PUT',
+    body: JSON.stringify(preferences),
   })
 }
 

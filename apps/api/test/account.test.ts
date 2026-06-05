@@ -13,6 +13,7 @@ function cookieHeader(response: { headers: Record<string, string | string[] | un
 }
 
 async function clearDb() {
+  await prisma.userPreference.deleteMany()
   await prisma.taskImage.deleteMany()
   await prisma.task.deleteMany()
   await prisma.imageAsset.deleteMany()
@@ -120,5 +121,77 @@ describeWithDb('account self-service', () => {
     const sessions = (after.json() as { sessions: Array<{ current: boolean }> }).sessions
     expect(sessions.length).toBe(1)
     expect(sessions[0]!.current).toBe(true)
+  })
+
+  it('stores client preferences per user and strips secret-looking fields', async () => {
+    const ownerCookie = await register(app, 'owner@example.com')
+    const otherCookie = await register(app, 'other@example.com')
+
+    const empty = await app.inject({
+      method: 'GET',
+      url: '/api/preferences/client',
+      headers: { cookie: ownerCookie },
+    })
+    expect(empty.statusCode).toBe(200)
+    expect(empty.json()).toMatchObject({ preferences: null, updatedAt: null })
+
+    const save = await app.inject({
+      method: 'PUT',
+      url: '/api/preferences/client',
+      headers: { cookie: ownerCookie },
+      payload: {
+        version: 1,
+        settings: {
+          activeProfileId: 'profile-a',
+          apiKey: 'should-not-be-stored',
+          profileConfig: {
+            'profile-a': {
+              timeout: 120,
+              secret: 'hidden',
+            },
+          },
+        },
+        params: { size: '1024x1024', quality: 'high', output_format: 'webp', output_compression: 80, moderation: 'auto', n: 2 },
+        favoriteCollections: [{ id: 'fav-a', name: 'A', createdAt: 1, updatedAt: 1 }],
+        defaultFavoriteCollectionId: 'fav-a',
+        taskFavorites: { 'task-a': ['fav-a'] },
+        ui: { appMode: 'agent', accessToken: 'hidden-token' },
+      },
+    })
+    expect(save.statusCode).toBe(200)
+    const saved = save.json() as { preferences: Record<string, unknown>; updatedAt: string }
+    expect(saved.updatedAt).toBeTruthy()
+    expect(JSON.stringify(saved.preferences)).not.toContain('should-not-be-stored')
+    expect(JSON.stringify(saved.preferences)).not.toContain('hidden-token')
+    expect(saved.preferences).toMatchObject({
+      version: 1,
+      settings: {
+        activeProfileId: 'profile-a',
+        profileConfig: {
+          'profile-a': {
+            timeout: 120,
+          },
+        },
+      },
+      params: { size: '1024x1024', quality: 'high', output_format: 'webp', output_compression: 80, moderation: 'auto', n: 2 },
+      defaultFavoriteCollectionId: 'fav-a',
+      taskFavorites: { 'task-a': ['fav-a'] },
+    })
+
+    const loaded = await app.inject({
+      method: 'GET',
+      url: '/api/preferences/client',
+      headers: { cookie: ownerCookie },
+    })
+    expect(loaded.statusCode).toBe(200)
+    expect((loaded.json() as { preferences: unknown }).preferences).toEqual(saved.preferences)
+
+    const other = await app.inject({
+      method: 'GET',
+      url: '/api/preferences/client',
+      headers: { cookie: otherCookie },
+    })
+    expect(other.statusCode).toBe(200)
+    expect(other.json()).toMatchObject({ preferences: null, updatedAt: null })
   })
 })

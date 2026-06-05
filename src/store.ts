@@ -48,9 +48,13 @@ import {
   deleteSaasTask,
   fetchSaasImageDataUrl,
   fetchSaasImageThumbnailDataUrl,
+  getSaasClientPreferences,
   isSaasMode,
   listSaasTasks,
   SaasApiError,
+  updateSaasClientPreferences,
+  type SaasClientPreferences,
+  type SaasSyncedSettings,
   type SaasTaskEvent,
 } from './lib/saasApi'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
@@ -89,6 +93,7 @@ const CUSTOM_RECOVERY_POLL_MS = 10_000
 const SAAS_TASK_EVENT_CURSOR_KEY = 'gpt-image-playground.saas-task-event-cursor'
 const SAAS_LOCAL_PENDING_PRESERVE_MS = 60_000
 const SAAS_FULL_TASK_REFRESH_MIN_INTERVAL_MS = 30_000
+const SAAS_PREFERENCES_SYNC_DEBOUNCE_MS = 1_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const AGENT_ROUND_IMAGE_MENTION_RE = /@(?:第)?(\d+)轮图(\d+)/g
@@ -98,6 +103,11 @@ const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let saasTaskEventSource: EventSource | null = null
 let lastSaasFullTaskRefreshAt = 0
 let saasTaskEventsConnectedOnce = false
+let saasPreferencesHydrated = false
+let saasPreferencesApplying = false
+let saasPreferencesSyncTimer: ReturnType<typeof setTimeout> | null = null
+let saasLastSyncedPreferencesJson = ''
+const saasTaskFavoriteIdsByTaskId = new Map<string, string[]>()
 const agentRoundControllers = new Map<string, AbortController>()
 let agentConversationPersistenceReady = false
 let agentConversationMigrationPending = false
@@ -1285,6 +1295,7 @@ export const useStore = create<AppState>()(
             agentEditingRoundId: null,
             ...(state.appMode === 'agent' ? restoreGalleryInputDraftState(galleryInputDraft) : {}),
           }))
+          scheduleSaasPreferencesSync()
           return
         }
 
@@ -1304,6 +1315,7 @@ export const useStore = create<AppState>()(
             selectedFavoriteCollectionIds: [],
             ...restoreAgentInputDraftState(state.agentInputDrafts, state.activeAgentConversationId),
           }))
+          scheduleSaasPreferencesSync()
           return
         }
 
@@ -1333,53 +1345,59 @@ export const useStore = create<AppState>()(
 
       // Settings
       settings: { ...DEFAULT_SETTINGS },
-      setSettings: (s) => set((st) => {
-        const previous = normalizeSettings(st.settings)
-        const incoming = s as Partial<AppSettings>
-        const hasLegacyOverrides =
-          incoming.baseUrl !== undefined ||
-          incoming.apiKey !== undefined ||
-          incoming.model !== undefined ||
-          incoming.timeout !== undefined ||
-          incoming.apiMode !== undefined ||
-          incoming.codexCli !== undefined ||
-          incoming.apiProxy !== undefined ||
-          incoming.streamImages !== undefined ||
-          incoming.streamPartialImages !== undefined
-        const merged = normalizeSettings({ ...previous, ...incoming })
-        if (hasLegacyOverrides && incoming.profiles === undefined) {
-          merged.profiles = merged.profiles.map((profile) =>
-            profile.id === merged.activeProfileId
-              ? {
-                  ...profile,
-                  baseUrl: incoming.baseUrl ?? profile.baseUrl,
-                  apiKey: incoming.apiKey ?? profile.apiKey,
-                  model: incoming.model ?? profile.model,
-                  timeout: incoming.timeout ?? profile.timeout,
-                  apiMode: incoming.apiMode === 'images' || incoming.apiMode === 'responses' ? incoming.apiMode : profile.apiMode,
-                  codexCli: incoming.codexCli ?? profile.codexCli,
-                  apiProxy: incoming.apiProxy ?? profile.apiProxy,
-                  streamImages: incoming.streamImages ?? profile.streamImages,
-                  streamPartialImages: incoming.streamPartialImages ?? profile.streamPartialImages,
-                }
-              : profile,
-          )
-        }
-        const settings = normalizeSettings(merged)
-        const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
-        return {
-          settings,
-          ...(shouldClearReusedProfile
-            ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
-            : {}),
-        }
-      }),
+      setSettings: (s) => {
+        set((st) => {
+          const previous = normalizeSettings(st.settings)
+          const incoming = s as Partial<AppSettings>
+          const hasLegacyOverrides =
+            incoming.baseUrl !== undefined ||
+            incoming.apiKey !== undefined ||
+            incoming.model !== undefined ||
+            incoming.timeout !== undefined ||
+            incoming.apiMode !== undefined ||
+            incoming.codexCli !== undefined ||
+            incoming.apiProxy !== undefined ||
+            incoming.streamImages !== undefined ||
+            incoming.streamPartialImages !== undefined
+          const merged = normalizeSettings({ ...previous, ...incoming })
+          if (hasLegacyOverrides && incoming.profiles === undefined) {
+            merged.profiles = merged.profiles.map((profile) =>
+              profile.id === merged.activeProfileId
+                ? {
+                    ...profile,
+                    baseUrl: incoming.baseUrl ?? profile.baseUrl,
+                    apiKey: incoming.apiKey ?? profile.apiKey,
+                    model: incoming.model ?? profile.model,
+                    timeout: incoming.timeout ?? profile.timeout,
+                    apiMode: incoming.apiMode === 'images' || incoming.apiMode === 'responses' ? incoming.apiMode : profile.apiMode,
+                    codexCli: incoming.codexCli ?? profile.codexCli,
+                    apiProxy: incoming.apiProxy ?? profile.apiProxy,
+                    streamImages: incoming.streamImages ?? profile.streamImages,
+                    streamPartialImages: incoming.streamPartialImages ?? profile.streamPartialImages,
+                  }
+                : profile,
+            )
+          }
+          const settings = normalizeSettings(merged)
+          const shouldClearReusedProfile = st.reusedTaskApiProfileId && settings.activeProfileId === st.reusedTaskApiProfileId
+          return {
+            settings,
+            ...(shouldClearReusedProfile
+              ? { reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false }
+              : {}),
+          }
+        })
+        scheduleSaasPreferencesSync()
+      },
       dismissedCodexCliPrompts: [],
-      dismissCodexCliPrompt: (key) => set((st) => ({
-        dismissedCodexCliPrompts: st.dismissedCodexCliPrompts.includes(key)
-          ? st.dismissedCodexCliPrompts
-          : [...st.dismissedCodexCliPrompts, key],
-      })),
+      dismissCodexCliPrompt: (key) => {
+        set((st) => ({
+          dismissedCodexCliPrompts: st.dismissedCodexCliPrompts.includes(key)
+            ? st.dismissedCodexCliPrompts
+            : [...st.dismissedCodexCliPrompts, key],
+        }))
+        scheduleSaasPreferencesSync()
+      },
 
       // Input
       prompt: '',
@@ -1520,7 +1538,10 @@ export const useStore = create<AppState>()(
 
       // Params
       params: { ...DEFAULT_PARAMS },
-      setParams: (p) => set((s) => ({ params: { ...s.params, ...p } })),
+      setParams: (p) => {
+        set((s) => ({ params: { ...s.params, ...p } }))
+        scheduleSaasPreferencesSync()
+      },
       reusedTaskApiProfileId: null,
       reusedTaskApiProfileName: null,
       reusedTaskApiProfileMissing: false,
@@ -1617,9 +1638,18 @@ export const useStore = create<AppState>()(
           ...(activeDeleted ? clearInputDraftState() : {}),
         }
       }),
-      setAgentSidebarCollapsed: (agentSidebarCollapsed) => set({ agentSidebarCollapsed }),
-      setAgentAssetTab: (agentAssetTab) => set({ agentAssetTab }),
-      setAgentAssetPanelCollapsed: (agentAssetPanelCollapsed) => set({ agentAssetPanelCollapsed }),
+      setAgentSidebarCollapsed: (agentSidebarCollapsed) => {
+        set({ agentSidebarCollapsed })
+        scheduleSaasPreferencesSync()
+      },
+      setAgentAssetTab: (agentAssetTab) => {
+        set({ agentAssetTab })
+        scheduleSaasPreferencesSync()
+      },
+      setAgentAssetPanelCollapsed: (agentAssetPanelCollapsed) => {
+        set({ agentAssetPanelCollapsed })
+        scheduleSaasPreferencesSync()
+      },
       setAgentMobileHeaderVisible: (agentMobileHeaderVisible) => set({ agentMobileHeaderVisible }),
       setAgentEditingRoundId: (agentEditingRoundId) => set({ agentEditingRoundId }),
       setAgentEditingConversationId: (agentEditingConversationId) => set({ agentEditingConversationId }),
@@ -1633,19 +1663,25 @@ export const useStore = create<AppState>()(
           : {}),
       })),
       favoriteCollections: [createDefaultFavoriteCollection()],
-      setFavoriteCollections: (favoriteCollections) => set((state) => {
-        const nextCollections = ensureDefaultFavoriteCollection(normalizeFavoriteCollections(favoriteCollections))
-        return {
-          favoriteCollections: nextCollections,
-          defaultFavoriteCollectionId: resolveDefaultFavoriteCollectionId(nextCollections, state.defaultFavoriteCollectionId),
-        }
-      }),
+      setFavoriteCollections: (favoriteCollections) => {
+        set((state) => {
+          const nextCollections = ensureDefaultFavoriteCollection(normalizeFavoriteCollections(favoriteCollections))
+          return {
+            favoriteCollections: nextCollections,
+            defaultFavoriteCollectionId: resolveDefaultFavoriteCollectionId(nextCollections, state.defaultFavoriteCollectionId),
+          }
+        })
+        scheduleSaasPreferencesSync()
+      },
       defaultFavoriteCollectionId: DEFAULT_FAVORITE_COLLECTION_ID,
-      setDefaultFavoriteCollectionId: (defaultFavoriteCollectionId) => set((state) => (
-        defaultFavoriteCollectionId === null || state.favoriteCollections.some((collection) => collection.id === defaultFavoriteCollectionId)
-          ? { defaultFavoriteCollectionId }
-          : state
-      )),
+      setDefaultFavoriteCollectionId: (defaultFavoriteCollectionId) => {
+        set((state) => (
+          defaultFavoriteCollectionId === null || state.favoriteCollections.some((collection) => collection.id === defaultFavoriteCollectionId)
+            ? { defaultFavoriteCollectionId }
+            : state
+        ))
+        scheduleSaasPreferencesSync()
+      },
       activeFavoriteCollectionId: null,
       isManageCollectionsModalOpen: false,
       setActiveFavoriteCollectionId: (activeFavoriteCollectionId) => set({ activeFavoriteCollectionId, selectedTaskIds: [], selectedFavoriteCollectionIds: [] }),
@@ -1748,7 +1784,10 @@ export const useStore = create<AppState>()(
       supportPromptDismissed: false,
       supportPromptSkippedForImportedData: false,
       setSupportPromptOpen: (supportPromptOpen) => set({ supportPromptOpen }),
-      dismissSupportPrompt: () => set({ supportPromptOpen: false, supportPromptDismissed: true }),
+      dismissSupportPrompt: () => {
+        set({ supportPromptOpen: false, supportPromptDismissed: true })
+        scheduleSaasPreferencesSync()
+      },
 
       // Toast
       toast: null,
@@ -1896,7 +1935,246 @@ function clearOpenAIWatchdogTimer(taskId: string) {
   openAIWatchdogTimers.delete(taskId)
 }
 
+function profilePreferenceConfig(profile: ApiProfile): Partial<Pick<ApiProfile, 'timeout' | 'codexCli' | 'streamImages' | 'streamPartialImages' | 'responseFormatB64Json'>> {
+  return {
+    timeout: profile.timeout,
+    codexCli: profile.codexCli,
+    streamImages: profile.streamImages,
+    streamPartialImages: profile.streamPartialImages,
+    responseFormatB64Json: profile.responseFormatB64Json,
+  }
+}
+
+function buildSaasSyncedSettings(settings: AppSettings): SaasSyncedSettings {
+  const normalized = normalizeSettings(settings)
+  return {
+    activeProfileId: normalized.activeProfileId,
+    clearInputAfterSubmit: normalized.clearInputAfterSubmit,
+    persistInputOnRestart: normalized.persistInputOnRestart,
+    reuseTaskApiProfileTemporarily: normalized.reuseTaskApiProfileTemporarily,
+    alwaysShowRetryButton: normalized.alwaysShowRetryButton,
+    taskCompletionNotification: normalized.taskCompletionNotification,
+    enterSubmit: normalized.enterSubmit,
+    referenceImageEditAction: normalized.referenceImageEditAction,
+    zipDownloadRoutes: normalized.zipDownloadRoutes,
+    agentScrollToBottomAfterSubmit: normalized.agentScrollToBottomAfterSubmit,
+    agentMaxToolRounds: normalized.agentMaxToolRounds,
+    agentWebSearch: normalized.agentWebSearch,
+    profileConfig: Object.fromEntries(normalized.profiles.map((profile) => [
+      profile.id,
+      profilePreferenceConfig(profile),
+    ])),
+  }
+}
+
+function applySaasSyncedSettings(current: AppSettings, synced: unknown): AppSettings {
+  if (!isRecord(synced)) return current
+  const profileConfig = isRecord(synced.profileConfig) ? synced.profileConfig : {}
+  const currentSettings = normalizeSettings(current)
+  const profiles = currentSettings.profiles.map((profile) => {
+    const config = (isRecord(profileConfig[profile.id]) ? profileConfig[profile.id] : {}) as Record<string, unknown>
+    return {
+      ...profile,
+      timeout: typeof config.timeout === 'number' ? config.timeout : profile.timeout,
+      codexCli: typeof config.codexCli === 'boolean' ? config.codexCli : profile.codexCli,
+      streamImages: typeof config.streamImages === 'boolean' ? config.streamImages : profile.streamImages,
+      streamPartialImages: typeof config.streamPartialImages === 'number' ? config.streamPartialImages : profile.streamPartialImages,
+      responseFormatB64Json: typeof config.responseFormatB64Json === 'boolean' ? config.responseFormatB64Json : profile.responseFormatB64Json,
+    }
+  })
+  const activeProfileId = typeof synced.activeProfileId === 'string' && profiles.some((profile) => profile.id === synced.activeProfileId)
+    ? synced.activeProfileId
+    : currentSettings.activeProfileId
+  return normalizeSettings({
+    ...currentSettings,
+    clearInputAfterSubmit: typeof synced.clearInputAfterSubmit === 'boolean' ? synced.clearInputAfterSubmit : currentSettings.clearInputAfterSubmit,
+    persistInputOnRestart: typeof synced.persistInputOnRestart === 'boolean' ? synced.persistInputOnRestart : currentSettings.persistInputOnRestart,
+    reuseTaskApiProfileTemporarily: typeof synced.reuseTaskApiProfileTemporarily === 'boolean' ? synced.reuseTaskApiProfileTemporarily : currentSettings.reuseTaskApiProfileTemporarily,
+    alwaysShowRetryButton: typeof synced.alwaysShowRetryButton === 'boolean' ? synced.alwaysShowRetryButton : currentSettings.alwaysShowRetryButton,
+    taskCompletionNotification: typeof synced.taskCompletionNotification === 'boolean' ? synced.taskCompletionNotification : currentSettings.taskCompletionNotification,
+    enterSubmit: typeof synced.enterSubmit === 'boolean' ? synced.enterSubmit : currentSettings.enterSubmit,
+    referenceImageEditAction: typeof synced.referenceImageEditAction === 'string' ? synced.referenceImageEditAction as AppSettings['referenceImageEditAction'] : currentSettings.referenceImageEditAction,
+    zipDownloadRoutes: Array.isArray(synced.zipDownloadRoutes) ? synced.zipDownloadRoutes as AppSettings['zipDownloadRoutes'] : currentSettings.zipDownloadRoutes,
+    agentScrollToBottomAfterSubmit: typeof synced.agentScrollToBottomAfterSubmit === 'boolean' ? synced.agentScrollToBottomAfterSubmit : currentSettings.agentScrollToBottomAfterSubmit,
+    agentMaxToolRounds: typeof synced.agentMaxToolRounds === 'number' ? synced.agentMaxToolRounds : currentSettings.agentMaxToolRounds,
+    agentWebSearch: typeof synced.agentWebSearch === 'boolean' ? synced.agentWebSearch : currentSettings.agentWebSearch,
+    profiles,
+    activeProfileId,
+  })
+}
+
+function applySaasSyncedParams(current: TaskParams, synced: unknown, settings: AppSettings): TaskParams {
+  if (!isRecord(synced)) return normalizeParamsForSettings(current, settings)
+  return normalizeParamsForSettings({
+    ...current,
+    size: typeof synced.size === 'string' ? synced.size : current.size,
+    quality: synced.quality === 'auto' || synced.quality === 'low' || synced.quality === 'medium' || synced.quality === 'high'
+      ? synced.quality
+      : current.quality,
+    output_format: synced.output_format === 'png' || synced.output_format === 'jpeg' || synced.output_format === 'webp'
+      ? synced.output_format
+      : current.output_format,
+    output_compression: typeof synced.output_compression === 'number' || synced.output_compression === null
+      ? synced.output_compression
+      : current.output_compression,
+    moderation: synced.moderation === 'auto' || synced.moderation === 'low' ? synced.moderation : current.moderation,
+    n: typeof synced.n === 'number' ? synced.n : current.n,
+  }, settings)
+}
+
+function setSaasTaskFavoriteMap(taskFavorites: unknown): void {
+  saasTaskFavoriteIdsByTaskId.clear()
+  if (!isRecord(taskFavorites)) return
+  for (const [taskId, ids] of Object.entries(taskFavorites)) {
+    const favoriteIds = normalizeFavoriteCollectionIds(ids)
+    if (taskId && favoriteIds.length) saasTaskFavoriteIdsByTaskId.set(taskId, favoriteIds)
+  }
+}
+
+function seedSaasTaskFavoriteMapFromTasks(tasks: TaskRecord[]): void {
+  saasTaskFavoriteIdsByTaskId.clear()
+  for (const task of tasks) {
+    const ids = getTaskFavoriteCollectionIds(task)
+    if (ids.length) saasTaskFavoriteIdsByTaskId.set(task.id, ids)
+  }
+}
+
+function updateSaasTaskFavoriteMapFromTask(task: TaskRecord): void {
+  const ids = getTaskFavoriteCollectionIds(task)
+  if (ids.length) saasTaskFavoriteIdsByTaskId.set(task.id, ids)
+  else saasTaskFavoriteIdsByTaskId.delete(task.id)
+}
+
+function applySaasTaskFavoriteState(task: TaskRecord): TaskRecord {
+  if (!saasPreferencesHydrated) return task
+  const ids = saasTaskFavoriteIdsByTaskId.get(task.id) ?? []
+  const isFavorite = ids.length > 0
+  if (Boolean(task.isFavorite) === isFavorite && sameFavoriteCollectionIds(task.favoriteCollectionIds ?? [], ids)) return task
+  return {
+    ...task,
+    isFavorite,
+    favoriteCollectionIds: ids,
+  }
+}
+
+function applySaasTaskFavorites(tasks: TaskRecord[]): TaskRecord[] {
+  if (!saasPreferencesHydrated) return tasks
+  return tasks.map(applySaasTaskFavoriteState)
+}
+
+function buildTaskFavoritesPreference(tasks: TaskRecord[]): Record<string, string[]> {
+  const taskFavorites: Record<string, string[]> = {}
+  for (const task of tasks) {
+    const ids = getTaskFavoriteCollectionIds(task)
+    if (ids.length) taskFavorites[task.id] = ids
+  }
+  for (const [taskId, ids] of saasTaskFavoriteIdsByTaskId) {
+    if (ids.length && !taskFavorites[taskId]) taskFavorites[taskId] = ids
+  }
+  return taskFavorites
+}
+
+function buildSaasClientPreferences(state = useStore.getState()): SaasClientPreferences {
+  return {
+    version: 1,
+    settings: buildSaasSyncedSettings(state.settings),
+    params: state.params,
+    favoriteCollections: state.favoriteCollections,
+    defaultFavoriteCollectionId: state.defaultFavoriteCollectionId,
+    taskFavorites: buildTaskFavoritesPreference(state.tasks),
+    ui: {
+      appMode: state.appMode,
+      agentSidebarCollapsed: state.agentSidebarCollapsed,
+      agentAssetTab: state.agentAssetTab,
+      agentAssetPanelCollapsed: state.agentAssetPanelCollapsed,
+      dismissedCodexCliPrompts: state.dismissedCodexCliPrompts,
+      supportPromptDismissed: state.supportPromptDismissed,
+    },
+  }
+}
+
+function scheduleSaasPreferencesSync(delay = SAAS_PREFERENCES_SYNC_DEBOUNCE_MS): void {
+  if (!isSaasMode() || !saasPreferencesHydrated || saasPreferencesApplying) return
+  if (saasPreferencesSyncTimer) clearTimeout(saasPreferencesSyncTimer)
+  saasPreferencesSyncTimer = setTimeout(() => {
+    saasPreferencesSyncTimer = null
+    void flushSaasPreferencesSync()
+  }, delay)
+}
+
+async function flushSaasPreferencesSync(): Promise<void> {
+  if (!isSaasMode() || !saasPreferencesHydrated || saasPreferencesApplying) return
+  const preferences = buildSaasClientPreferences()
+  const preferencesJson = JSON.stringify(preferences)
+  if (preferencesJson === saasLastSyncedPreferencesJson) return
+  saasLastSyncedPreferencesJson = preferencesJson
+  try {
+    await updateSaasClientPreferences(preferences)
+  } catch (error) {
+    saasLastSyncedPreferencesJson = ''
+    console.warn('Failed to sync SaaS client preferences:', error)
+  }
+}
+
+function applySaasClientPreferences(preferences: SaasClientPreferences, seedTasks: TaskRecord[]): TaskRecord[] {
+  saasPreferencesApplying = true
+  try {
+    const state = useStore.getState()
+    const favoriteCollections = Array.isArray(preferences.favoriteCollections)
+      ? ensureDefaultFavoriteCollection(normalizeFavoriteCollections(preferences.favoriteCollections))
+      : state.favoriteCollections
+    const defaultFavoriteCollectionId = resolveDefaultFavoriteCollectionId(favoriteCollections, preferences.defaultFavoriteCollectionId)
+    setSaasTaskFavoriteMap(preferences.taskFavorites)
+    const ui = isRecord(preferences.ui) ? preferences.ui : {}
+    const nextAppMode = ui.appMode === 'agent' ? 'agent' : ui.appMode === 'gallery' ? 'gallery' : state.appMode
+    const nextTasks = applySaasTaskFavorites(seedTasks)
+    const settings = applySaasSyncedSettings(state.settings, preferences.settings)
+    useStore.setState({
+      settings,
+      params: applySaasSyncedParams(state.params, preferences.params, settings),
+      favoriteCollections,
+      defaultFavoriteCollectionId,
+      appMode: nextAppMode,
+      agentSidebarCollapsed: typeof ui.agentSidebarCollapsed === 'boolean' ? ui.agentSidebarCollapsed : state.agentSidebarCollapsed,
+      agentAssetTab: ui.agentAssetTab === 'references' ? 'references' : ui.agentAssetTab === 'outputs' ? 'outputs' : state.agentAssetTab,
+      agentAssetPanelCollapsed: typeof ui.agentAssetPanelCollapsed === 'boolean' ? ui.agentAssetPanelCollapsed : state.agentAssetPanelCollapsed,
+      dismissedCodexCliPrompts: Array.isArray(ui.dismissedCodexCliPrompts) ? ui.dismissedCodexCliPrompts.map(String) : state.dismissedCodexCliPrompts,
+      supportPromptDismissed: typeof ui.supportPromptDismissed === 'boolean' ? ui.supportPromptDismissed : state.supportPromptDismissed,
+      ...(state.tasks.length ? { tasks: applySaasTaskFavorites(state.tasks) } : {}),
+    })
+    return nextTasks
+  } finally {
+    saasPreferencesApplying = false
+  }
+}
+
+async function hydrateSaasClientPreferences(seedTasks: TaskRecord[]): Promise<TaskRecord[]> {
+  if (!isSaasMode() || saasPreferencesHydrated) return seedTasks
+  try {
+    const result = await getSaasClientPreferences()
+    if (result.preferences) {
+      saasPreferencesHydrated = true
+      const tasks = applySaasClientPreferences(result.preferences, seedTasks)
+      saasLastSyncedPreferencesJson = JSON.stringify(buildSaasClientPreferences())
+      return tasks
+    }
+    seedSaasTaskFavoriteMapFromTasks(seedTasks)
+    saasPreferencesHydrated = true
+    const preferences = buildSaasClientPreferences()
+    saasLastSyncedPreferencesJson = JSON.stringify(preferences)
+    void updateSaasClientPreferences(preferences).catch((error) => {
+      saasLastSyncedPreferencesJson = ''
+      console.warn('Failed to create SaaS client preferences:', error)
+    })
+    return seedTasks
+  } catch (error) {
+    console.warn('Failed to load SaaS client preferences:', error)
+    return seedTasks
+  }
+}
+
 function mergeSaasTaskLocalState(remoteTask: TaskRecord, localTask?: TaskRecord): TaskRecord {
+  if (saasPreferencesHydrated) return applySaasTaskFavoriteState(remoteTask)
   return localTask
     ? {
         ...remoteTask,
@@ -2333,6 +2611,9 @@ async function recoverFalTask(taskId: string) {
 export async function initStore() {
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
   let storedTasks = await getAllTasks()
+  if (isSaasMode()) {
+    storedTasks = await hydrateSaasClientPreferences(storedTasks)
+  }
   if (isSaasMode()) {
     try {
       const localTasksById = new Map(storedTasks.map((task) => [task.id, task]))
@@ -4560,6 +4841,7 @@ function normalizeFavoritePatch(task: TaskRecord, patch: Partial<TaskRecord>, de
 
 export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
   const { tasks, setTasks, defaultFavoriteCollectionId } = useStore.getState()
+  const updatesFavoriteState = 'favoriteCollectionIds' in patch || 'isFavorite' in patch
   const updated = tasks.map((t) =>
     t.id === taskId ? { ...t, ...normalizeFavoritePatch(t, patch, defaultFavoriteCollectionId) } : t,
   )
@@ -4567,6 +4849,10 @@ export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
   setTasks(updated)
   maybeOpenSupportPrompt(tasks, updated, taskId)
   if (task) putTask(task)
+  if (task && updatesFavoriteState) {
+    updateSaasTaskFavoriteMapFromTask(task)
+    scheduleSaasPreferencesSync()
+  }
 }
 
 function normalizeFavoriteCollectionIds(ids: unknown) {
@@ -4668,6 +4954,10 @@ export async function updateTasksFavoriteCollections(taskIds: string[], collecti
   }
   setTasks(updated)
   await Promise.all(updated.filter((task) => changedTaskIds.has(task.id)).map((task) => putTask(task)))
+  for (const task of updated) {
+    if (changedTaskIds.has(task.id)) updateSaasTaskFavoriteMapFromTask(task)
+  }
+  scheduleSaasPreferencesSync()
   clearSelection()
   showToast(ids.length ? '收藏夹已更新' : '已取消收藏', 'success')
 }
@@ -4708,6 +4998,9 @@ export async function deleteFavoriteCollection(collectionId: string, deleteTasks
       })
       useStore.getState().setTasks(updated)
       await Promise.all(updated.filter((task) => idsByTaskToKeep.has(task.id)).map((task) => putTask(task)))
+      for (const task of updated) {
+        if (idsByTaskToKeep.has(task.id)) updateSaasTaskFavoriteMapFromTask(task)
+      }
     }
     if (taskIdsToDelete.length) await removeMultipleTasks(taskIdsToDelete)
   } else if (taskIds.length) {
@@ -4722,8 +5015,12 @@ export async function deleteFavoriteCollection(collectionId: string, deleteTasks
     })
     state.setTasks(updated)
     await Promise.all(updated.filter((task) => idsByTaskId.has(task.id)).map((task) => putTask(task)))
+    for (const task of updated) {
+      if (idsByTaskId.has(task.id)) updateSaasTaskFavoriteMapFromTask(task)
+    }
   }
   useStore.getState().setSelectedFavoriteCollectionIds((ids) => ids.filter((id) => id !== collectionId))
+  scheduleSaasPreferencesSync()
   useStore.getState().showToast(`已删除收藏夹「${collection.name}」`, 'success')
 }
 
@@ -4882,7 +5179,9 @@ async function removeTasksLocally(taskIds: string[], options: { showToast?: fals
 
   setTasks(remaining)
   await Promise.all(uniqueTaskIds.map((id) => dbDeleteTask(id).catch(() => undefined)))
+  for (const task of deletedTasks) saasTaskFavoriteIdsByTaskId.delete(task.id)
   await deleteUnreferencedImageIds(deletedImageIds)
+  scheduleSaasPreferencesSync()
 
   const newSelection = selectedTaskIds.filter((id) => !toDelete.has(id))
   if (newSelection.length !== selectedTaskIds.length) {
@@ -5257,6 +5556,7 @@ export async function importData(file: File, options: ImportOptions = { importCo
       await replaceStoredAgentConversations(useStore.getState().agentConversations)
       skipSupportPromptForImportedData(tasks)
       scheduleThumbnailBackfill(importedImageIds)
+      scheduleSaasPreferencesSync()
     }
 
     if (options.importConfig && data.settings) {

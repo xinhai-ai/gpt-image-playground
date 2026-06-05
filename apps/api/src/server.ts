@@ -49,6 +49,7 @@ const TASK_EVENT_SNAPSHOT_TASK_LIMIT = 200
 const TASK_EVENT_RETENTION_MS = 14 * 24 * 60 * 60 * 1000
 const TASK_EVENT_PRUNE_INTERVAL_MS = 60 * 60 * 1000
 const TASK_WORKER_ID = `api-${randomUUID()}`
+const CLIENT_PREFERENCES_KEY = 'client'
 const AUTH_COOKIE_CLEAR_OPTIONS = {
   path: '/',
   sameSite: 'lax' as const,
@@ -158,6 +159,17 @@ const changePasswordSchema = z.object({
   logoutOtherSessions: z.boolean().optional(),
 })
 
+const clientPreferencesSchema = z.object({
+  version: z.number().int().min(1).max(1).default(1),
+  settings: z.unknown().optional(),
+  params: z.unknown().optional(),
+  favoriteCollections: z.unknown().optional(),
+  defaultFavoriteCollectionId: z.unknown().optional(),
+  taskFavorites: z.unknown().optional(),
+  ui: z.unknown().optional(),
+  updatedAt: z.unknown().optional(),
+}).passthrough()
+
 const sha256HexSchema = z.string().regex(/^[a-f0-9]{64}$/i).transform((value) => value.toLowerCase())
 
 const uploadUrlSchema = z.object({
@@ -244,6 +256,21 @@ const adminChannelPatchSchema = providerProfilePatchSchema.extend({
 
 function parseBody<T>(schema: z.ZodSchema<T>, body: unknown): T {
   return schema.parse(body)
+}
+
+function toPrismaJsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue
+}
+
+function sanitizeClientPreferenceValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeClientPreferenceValue)
+  if (!isRecord(value)) return value
+  const output: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value)) {
+    if (/(?:api[_-]?key|secret|access[_-]?token|refresh[_-]?token|id[_-]?token|password)/i.test(key)) continue
+    output[key] = sanitizeClientPreferenceValue(item)
+  }
+  return output
 }
 
 function requestPathname(url: string): string {
@@ -1930,6 +1957,72 @@ export async function buildApp() {
     })
     await writeUsageLog({ request, auth, action: 'account.update', targetType: 'user', targetId: user.id })
     return { user: { id: user.id, name: user.name } }
+  })
+
+  app.get('/api/preferences/client', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    const preference = await prisma.userPreference.findUnique({
+      where: {
+        userId_tenantId_key: {
+          userId: auth.user.id,
+          tenantId: auth.tenant.id,
+          key: CLIENT_PREFERENCES_KEY,
+        },
+      },
+      select: { value: true, updatedAt: true },
+    })
+    return {
+      preferences: preference?.value ?? null,
+      updatedAt: preference?.updatedAt.toISOString() ?? null,
+    }
+  })
+
+  app.put('/api/preferences/client', async (request, reply) => {
+    const auth = await requireAuth(request, reply)
+    if (!auth) return
+    if (!await enforceRateLimit(request, reply, {
+      bucket: 'preferences.client',
+      keyParts: [auth.user.id],
+      max: 120,
+      windowMs: 10 * 60_000,
+    })) return
+    const body = parseBody(clientPreferencesSchema, request.body)
+    const value = toPrismaJsonValue(sanitizeClientPreferenceValue({
+      ...body,
+      version: 1,
+      updatedAt: Date.now(),
+    }))
+    const preference = await prisma.userPreference.upsert({
+      where: {
+        userId_tenantId_key: {
+          userId: auth.user.id,
+          tenantId: auth.tenant.id,
+          key: CLIENT_PREFERENCES_KEY,
+        },
+      },
+      update: { value },
+      create: {
+        userId: auth.user.id,
+        tenantId: auth.tenant.id,
+        key: CLIENT_PREFERENCES_KEY,
+        value,
+      },
+      select: { value: true, updatedAt: true },
+    })
+    await writeUsageLog({
+      request,
+      auth,
+      action: 'preferences.client.update',
+      targetType: 'userPreference',
+      detail: {
+        key: CLIENT_PREFERENCES_KEY,
+      },
+    })
+    return {
+      preferences: preference.value,
+      updatedAt: preference.updatedAt.toISOString(),
+    }
   })
 
   app.post('/api/account/password', async (request, reply) => {
